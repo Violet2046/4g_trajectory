@@ -574,6 +574,38 @@ esp_err_t bmi160_tap_configure(bmi160_handle_t *handle,
 				BMI160_INT_TAP_EN | BMI160_INT_DOUBLE_TAP_EN);
 }
 
+esp_err_t bmi160_double_tap_configure(bmi160_handle_t *handle)
+{
+	esp_err_t err;
+
+	if (handle == NULL) {
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	/* Tap parameters with defaults */
+	err = bmi160_tap_configure(handle,
+				   BMI160_TAP_DUR_DEFAULT,
+				   BMI160_TAP_THR_DEFAULT,
+				   BMI160_TAP_SHOCK_DEFAULT,
+				   BMI160_TAP_QUIET_DEFAULT);
+	if (err != ESP_OK) return err;
+
+	/* Read-modify-write INT_MAP_1: add double-tap bit for INT2.
+	 * Preserve any existing INT1 mapping (INT_MAP_0) and other bits.
+	 * We only touch INT_MAP_1, leaving INT_MAP_0/2 unchanged. */
+	uint8_t map1;
+	err = bmi160_reg_read(handle, BMI160_INT_MAP_1, &map1, 1);
+	if (err != ESP_OK) return err;
+
+	map1 |= BMI160_INT_MAP_DOUBLE_TAP;   /* bit 6 = double-tap → INT2 */
+
+	err = bmi160_reg_write(handle, BMI160_INT_MAP_1, map1);
+	if (err != ESP_OK) return err;
+
+	ESP_LOGI(BMI160_TAG, "double-tap configured, mapped to INT2");
+	return ESP_OK;
+}
+
 esp_err_t bmi160_step_counter_configure(bmi160_handle_t *handle,
 					bool step_counter_en,
 					uint8_t sensitivity)

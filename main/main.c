@@ -27,6 +27,7 @@
 #include "esp_timer.h"
 
 #include "CT511N.h"
+#include "W25Q64.h"
 #include "sensor_hub.h"
 #include "storage_mgr.h"
 #include "app_utils.h"
@@ -42,7 +43,7 @@
 
 #define I2C_SDA                7
 #define I2C_SCL                8
-#define BMI160_INT1_PIN        9
+#define BMI160_INT1_PIN        LP_WAKEUP_GPIO
 
 #define GPTIMER_RESOLUTION_HZ  1000000
 
@@ -50,6 +51,10 @@
 #define INACTIVITY_TIMEOUT_MS  5000
 #define IDLE_POLL_MS           50
 #define LP_POLL_MS             200
+
+/* BMI160 INT2 pin for double-tap → IMG_RECEIVE mode.
+ * Double-tap the device to enter IMG_RECEIVE. */
+#define BMI160_INT2_PIN         0
 
 /* ======================================================================== */
 /*  System State                                                            */
@@ -59,28 +64,38 @@ typedef enum {
 	STATE_ACTIVE,
 	STATE_LOW_POWER,
 	STATE_SAMPLE,
+	STATE_DEEP_SLEEP,           /* fallback: RTC timer wakeup only */
+	STATE_IMG_RECEIVE,          /* BLE image receive + display */
 } sys_state_t;
 
 static const char *TAG = "main";
 
 /* ---- Handles ---- */
-static sensor_hub_t      *g_hub    = NULL;
-static ct511n_handle_t   *g_ct511n = NULL;
-static gptimer_handle_t   g_timer  = NULL;
+static sensor_hub_t      *g_hub     = NULL;
+static ct511n_handle_t   *g_ct511n  = NULL;
+static w25q64_handle_t   *g_w25q64  = NULL;  /* SPI NOR Flash            */
+static gptimer_handle_t   g_timer   = NULL;
 
 /* ---- ISR flags ---- */
 static volatile bool g_sample_flag = false;
 static volatile bool g_motion_flag = false;
+static volatile bool g_img_trigger_flag = false;  /* BMI160 double-tap      */
 static SemaphoreHandle_t g_motion_sem = NULL;
 
 /* ---- State tracking ---- */
 static sys_state_t g_state          = STATE_INIT;
 static int64_t     g_last_motion_us = 0;
 static uint32_t    g_sample_count   = 0;
+static int64_t     g_lp_enter_us    = 0;   /* when LOW_POWER was entered    */
 
 /* ======================================================================== */
 /*  ISR Handlers                                                             */
 /* ======================================================================== */
+
+static void IRAM_ATTR bmi160_double_tap_isr(void *arg)
+{
+	g_img_trigger_flag = true;
+}
 
 static bool IRAM_ATTR timer_on_alarm(gptimer_handle_t timer,
 				     const gptimer_alarm_event_data_t *edata,
@@ -137,8 +152,8 @@ static esp_err_t hardware_init(void)
 		.sda_io_num = I2C_SDA, .scl_io_num = I2C_SCL,
 		.bmi160_int1_pin = BMI160_INT1_PIN,
 		.bmi160_int1_type = GPIO_INTR_POSEDGE,
-		.bmi160_int2_pin = GPIO_NUM_NC,
-		.bmi160_int2_type = GPIO_INTR_DISABLE,
+		.bmi160_int2_pin = BMI160_INT2_PIN,
+		.bmi160_int2_type = GPIO_INTR_POSEDGE,
 	};
 	err = sensor_hub_init(&g_hub, &hub_cfg);
 	if (err != ESP_OK) {
@@ -147,9 +162,40 @@ static esp_err_t hardware_init(void)
 		return err;
 	}
 
-	/* Register motion ISR */
+	/* Register any-motion ISR (INT1) */
 	g_motion_sem = xSemaphoreCreateBinary();
 	bmi160_int1_isr_add(sensor_hub_get_bmi160(g_hub), bmi160_motion_isr, NULL);
+
+	/* Register double-tap ISR (INT2) — triggers IMG_RECEIVE */
+	bmi160_int2_isr_add(sensor_hub_get_bmi160(g_hub),
+			    bmi160_double_tap_isr, NULL);
+
+	/* ---- W25Q64 SPI NOR Flash ---- */
+	{
+		w25q64_config_t flash_cfg = {
+			.host      = SPI_HOST,
+			.cs_gpio   = W25Q64_CS_GPIO,
+			.sck_gpio  = SPI_SCK_GPIO,
+			.mosi_gpio = SPI_MOSI_GPIO,
+			.miso_gpio = SPI_MISO_GPIO,
+			.wp_gpio   = -1,
+			.hold_gpio = -1,
+			.dma_chan  = SPI_DMA_CH_AUTO,
+			.freq_hz   = 26 * 1000 * 1000,  /* 26 MHz */
+		};
+		err = w25q64_init(&g_w25q64, &flash_cfg);
+		if (err != ESP_OK) {
+			ESP_LOGW(TAG, "W25Q64 init: %s — Flash disabled",
+				 esp_err_to_name(err));
+			g_w25q64 = NULL;
+		} else {
+			err = storage_init(g_w25q64);
+			if (err != ESP_OK) {
+				ESP_LOGW(TAG, "storage_init: %s",
+					 esp_err_to_name(err));
+			}
+		}
+	}
 
 	/* ---- gptimer ---- */
 	gptimer_config_t tcfg = {
@@ -179,6 +225,16 @@ void app_main(void)
 {
 	ESP_LOGI(TAG, "=== 4G Trajectory Logger ===");
 
+	/* Detect wakeup source after Deep-sleep / Light-sleep */
+	uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
+	if (wakeup_causes & BIT(ESP_SLEEP_WAKEUP_TIMER)) {
+		ESP_LOGI(TAG, "woke from DEEP_SLEEP (RTC timer)");
+	} else if (wakeup_causes & BIT(ESP_SLEEP_WAKEUP_GPIO)) {
+		ESP_LOGI(TAG, "woke from Light-sleep (GPIO any-motion)");
+	} else {
+		ESP_LOGI(TAG, "cold boot (normal power-on or reset)");
+	}
+
 	esp_err_t err = hardware_init();
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "hardware_init failed — HALTING");
@@ -202,10 +258,18 @@ void app_main(void)
 				g_last_motion_us = esp_timer_get_time();
 			}
 
+			/* BMI160 double-tap → IMG_RECEIVE */
+			if (g_img_trigger_flag) {
+				g_img_trigger_flag = false;
+				g_state = STATE_IMG_RECEIVE;
+				break;
+			}
+
 			/* Inactivity timeout → LOW_POWER */
 			if ((esp_timer_get_time() - g_last_motion_us) >
 			    (INACTIVITY_TIMEOUT_MS * 1000LL)) {
-				low_power_enter(g_timer, g_ct511n, NULL, g_hub);
+				low_power_enter(g_timer, g_ct511n,
+						g_w25q64, g_hub);
 				g_state = STATE_LOW_POWER;
 				break;
 			}
@@ -221,32 +285,105 @@ void app_main(void)
 			break;
 
 		case STATE_LOW_POWER:
-			/* ISR or polling — wake and go straight to sample+upload */
-			if (g_motion_flag) {
-				g_motion_flag = false;
-				low_power_exit(g_timer, g_ct511n, NULL, g_hub);
-				g_state = STATE_SAMPLE;
-				break;
-			}
+			/* --- First entry: configure GPIO wakeup for Light-sleep --- */
 			{
-				static uint64_t lp_last = 0;
-				uint64_t now = esp_timer_get_time();
-				if (now - lp_last > 1000000ULL) {
-					lp_last = now;
+				static bool sleep_cfg_done = false;
+				if (!sleep_cfg_done) {
+					low_power_sleep_configure();
+					g_lp_enter_us = esp_timer_get_time();
+					sleep_cfg_done = true;
+				}
+
+				/* Motion ISR fired (GPIO wakeup or edge while awake) */
+				if (g_motion_flag) {
+					g_motion_flag = false;
+					sleep_cfg_done = false;
+					low_power_sleep_unconfigure();
+					low_power_exit(g_timer, g_ct511n,
+						       g_w25q64, g_hub);
+					g_state = STATE_SAMPLE;
+					break;
+				}
+
+				/* Poll INT_STATUS as backup (runs after timer wakeup) */
+				{
 					uint8_t istat[4];
 					bmi160_handle_t *bmi = sensor_hub_get_bmi160(g_hub);
 					if (bmi && bmi160_int_status_read(bmi, istat) == ESP_OK) {
 						if (istat[0] & 0x07) {
-							ESP_LOGI(TAG, "any-motion via polling");
-							low_power_exit(g_timer, g_ct511n, NULL, g_hub);
+							ESP_LOGI(TAG, "any-motion via poll wakeup");
+							sleep_cfg_done = false;
+							low_power_sleep_unconfigure();
+							low_power_exit(g_timer, g_ct511n,
+								       g_w25q64, g_hub);
 							g_state = STATE_SAMPLE;
 							break;
 						}
 					}
 				}
+
+				/* Deep-sleep fallback: no motion for too long */
+				if (DEEP_SLEEP_FALLBACK_S > 0) {
+					int64_t elapsed_us = esp_timer_get_time() - g_lp_enter_us;
+					if (elapsed_us > (int64_t)DEEP_SLEEP_FALLBACK_S * 1000000LL) {
+						ESP_LOGI(TAG, "no motion for %u s — deep-sleep",
+							 DEEP_SLEEP_FALLBACK_S);
+						sleep_cfg_done = false;
+						low_power_sleep_unconfigure();
+						g_state = STATE_DEEP_SLEEP;
+						break;
+					}
+				}
+
+				/* --- Light-sleep until GPIO or 1 s timer wakeup --- */
+				esp_sleep_enable_timer_wakeup(1000000ULL);
+				low_power_sleep_enter();
+				/* wakeup: either motion (ISR set flag) or timer (poll above) */
 			}
-			vTaskDelay(pdMS_TO_TICKS(LP_POLL_MS));
 			break;
+
+		case STATE_DEEP_SLEEP:
+			low_power_deep_sleep_enter();
+			/* never reached */
+			break;
+
+		case STATE_IMG_RECEIVE: {
+			static bool img_init_done = false;
+			if (!img_init_done) {
+				esp_err_t err = img_recv_enter(SPI_HOST,
+							       g_w25q64);
+				if (err != ESP_OK) {
+					ESP_LOGE(TAG, "img_recv_enter: %s",
+						 esp_err_to_name(err));
+					g_state = STATE_ACTIVE;
+					break;
+				}
+				img_init_done = true;
+			}
+
+			/* Sample at 1 s intervals (driven by gptimer) */
+			if (g_sample_flag) {
+				g_sample_flag = false;
+				if (!img_recv_poll(g_hub, g_ct511n,
+						   g_sample_count++)) {
+					img_recv_exit();
+					img_init_done = false;
+					g_state = STATE_ACTIVE;
+					break;
+				}
+			}
+
+			/* Check if BLE transfer finished (non-sampling poll) */
+			if (!ble_img_is_busy() && img_init_done) {
+				img_recv_exit();
+				img_init_done = false;
+				g_state = STATE_ACTIVE;
+				break;
+			}
+
+			vTaskDelay(pdMS_TO_TICKS(50));
+			break;
+		}
 
 		case STATE_SAMPLE:
 			vTaskDelay(pdMS_TO_TICKS(CT_WAKE_DELAY_MS));

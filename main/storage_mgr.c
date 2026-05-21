@@ -18,6 +18,9 @@ static w25q64_handle_t *g_flash = NULL;
 /* Cached configuration (in RAM) */
 static storage_config_t g_cfg;
 
+/* RAM redirect mode — when set, record_append goes to RAM cache */
+static bool g_ram_mode = false;
+
 /* Cached write/read position */
 static uint32_t g_write_page = STORAGE_DATA_START_PAGE;
 static uint32_t g_read_page  = STORAGE_DATA_START_PAGE;
@@ -291,6 +294,12 @@ static bool     g_last_write_valid = false;
 esp_err_t storage_record_append(const storage_record_t *rec)
 {
 	if (rec == NULL) return ESP_ERR_INVALID_ARG;
+
+	/* RAM redirect mode: write to RAM cache instead of Flash */
+	if (g_ram_mode) {
+		return ram_cache_append(rec);
+	}
+
 	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
 
 	uint32_t page = g_write_page;
@@ -468,4 +477,133 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 		}
 	}
 	return crc;
+}
+
+/* ========================================================================= */
+/*  Image Cache Region (Flash second half)                                    */
+/* ========================================================================= */
+
+esp_err_t img_cache_erase_all(void)
+{
+	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
+
+	ESP_LOGI(STORAGE_TAG, "erasing image cache region (4 MB)…");
+	uint32_t addr = IMG_CACHE_BASE_ADDR;
+	uint32_t end  = IMG_CACHE_BASE_ADDR + IMG_CACHE_SIZE;
+
+	/* Erase sector by sector (4 KB each) */
+	while (addr < end) {
+		esp_err_t err = w25q64_sector_erase(g_flash, addr);
+		if (err != ESP_OK) {
+			ESP_LOGE(STORAGE_TAG, "sector erase @ 0x%lX: %s",
+				 addr, esp_err_to_name(err));
+			return err;
+		}
+		addr += W25Q64_SECTOR_SIZE;
+	}
+	ESP_LOGI(STORAGE_TAG, "image cache erase done");
+	return ESP_OK;
+}
+
+esp_err_t img_cache_write(uint32_t offset, const uint8_t *data, size_t len)
+{
+	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
+	if (offset + len > IMG_CACHE_SIZE) return ESP_ERR_INVALID_ARG;
+
+	uint32_t addr = IMG_CACHE_BASE_ADDR + offset;
+	/* Ensure we don't cross a 256-byte page boundary */
+	size_t max_write = W25Q64_PAGE_SIZE - (addr % W25Q64_PAGE_SIZE);
+	if (len > max_write) {
+		ESP_LOGW(STORAGE_TAG, "img_cache_write truncated to %u B",
+			 max_write);
+		len = max_write;
+	}
+
+	return w25q64_page_program(g_flash, addr, data, len);
+}
+
+esp_err_t img_cache_read(uint32_t offset, uint8_t *data, size_t len)
+{
+	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
+	if (offset + len > IMG_CACHE_SIZE) return ESP_ERR_INVALID_ARG;
+
+	return w25q64_read(g_flash, IMG_CACHE_BASE_ADDR + offset, data, len);
+}
+
+/* ========================================================================= */
+/*  RAM mode switch                                                          */
+/* ========================================================================= */
+
+void storage_set_ram_mode(bool enable)
+{
+	g_ram_mode = enable;
+	if (enable) {
+		ram_cache_init();
+		ESP_LOGI(STORAGE_TAG, "RAM mode ON — records go to RAM cache");
+	} else {
+		ESP_LOGI(STORAGE_TAG, "RAM mode OFF — records go to Flash");
+	}
+}
+
+/* ========================================================================= */
+/*  RAM Cache (circular buffer for samples during IMG_RECEIVE)               */
+/* ========================================================================= */
+
+static storage_record_t g_ram_cache[RAM_CACHE_CAPACITY];
+static uint32_t g_ram_write = 0;
+static uint32_t g_ram_count = 0;
+
+void ram_cache_init(void)
+{
+	g_ram_write = 0;
+	g_ram_count = 0;
+}
+
+esp_err_t ram_cache_append(const storage_record_t *rec)
+{
+	if (rec == NULL) return ESP_ERR_INVALID_ARG;
+
+	g_ram_cache[g_ram_write] = *rec;
+	g_ram_write = (g_ram_write + 1) % RAM_CACHE_CAPACITY;
+
+	if (g_ram_count < RAM_CACHE_CAPACITY) {
+		g_ram_count++;
+	} /* else: oldest record silently overwritten */
+
+	return ESP_OK;
+}
+
+uint32_t ram_cache_count(void)
+{
+	return g_ram_count;
+}
+
+esp_err_t ram_cache_flush(void)
+{
+	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
+	if (g_ram_count == 0) return ESP_OK;
+
+	ESP_LOGI(STORAGE_TAG, "flushing %lu RAM-cached records to Flash…",
+		 g_ram_count);
+
+	uint32_t start = (g_ram_write >= g_ram_count)
+			 ? (g_ram_write - g_ram_count)
+			 : (RAM_CACHE_CAPACITY + g_ram_write - g_ram_count);
+	start %= RAM_CACHE_CAPACITY;
+
+	esp_err_t last_err = ESP_OK;
+	for (uint32_t i = 0; i < g_ram_count; i++) {
+		uint32_t idx = (start + i) % RAM_CACHE_CAPACITY;
+		esp_err_t err = storage_record_append(&g_ram_cache[idx]);
+		if (err != ESP_OK) {
+			ESP_LOGW(STORAGE_TAG, "flush rec %lu: %s",
+				 i, esp_err_to_name(err));
+			last_err = err;
+			/* Continue flushing remaining records */
+		}
+	}
+
+	ram_cache_init();
+	ESP_LOGI(STORAGE_TAG, "RAM cache flush done (last_err=%d)", last_err);
+	return last_err;
 }

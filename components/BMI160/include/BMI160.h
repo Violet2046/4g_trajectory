@@ -164,10 +164,13 @@ extern "C" {
 /* ------------------------------------------------------------------------- */
 /*  Tap configuration (INT_TAP_0..3)                                          */
 /* ------------------------------------------------------------------------- */
-#define BMI160_TAP_DUR_DEFAULT       0x04
-#define BMI160_TAP_THR_DEFAULT       0x0A
-#define BMI160_TAP_SHOCK_DEFAULT     0x00
-#define BMI160_TAP_QUIET_DEFAULT     0x00
+#define BMI160_TAP_DUR_DEFAULT       0x04   /* 10 ms (LSB = 2.5 ms)          */
+#define BMI160_TAP_THR_DEFAULT       0x0A   /* ~0.6 g (LSB = 62.5 mg)        */
+#define BMI160_TAP_SHOCK_DEFAULT     0x00   /* 50 % of tap time              */
+#define BMI160_TAP_QUIET_DEFAULT     0x00   /* 30 ms quiet time              */
+
+/* INT_MAP_1 bit for double-tap */
+#define BMI160_INT_MAP_DOUBLE_TAP    (1U << 6)
 
 /* ------------------------------------------------------------------------- */
 /*  Step counter                                                              */
@@ -379,6 +382,15 @@ esp_err_t bmi160_tap_configure(bmi160_handle_t *handle,
 			       uint8_t threshold,
 			       uint8_t shock,
 			       uint8_t quiet);
+
+/**
+ * @brief  Convenience wrapper: enable double-tap with default parameters.
+ *
+ * Enables both single & double tap detection (INT_EN_2) and maps the
+ * double-tap event to INT2 (INT_MAP_1 bit 6).  Caller must still register
+ * the INT2 ISR via @ref bmi160_int2_isr_add.
+ */
+esp_err_t bmi160_double_tap_configure(bmi160_handle_t *handle);
 
 /**
  * @brief  Enable step-counter interrupt.

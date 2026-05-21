@@ -6,7 +6,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "driver/gpio.h"
+
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 
 #include "storage_mgr.h"
@@ -63,6 +66,51 @@ void low_power_exit(gptimer_handle_t timer,
 	sensor_hub_wake(hub);
 	timer_start(timer, 1);
 	ESP_LOGI(TAG, "all modules restored to ACTIVE");
+}
+
+/* ========================================================================= */
+/*  Light-sleep / Deep-sleep helpers                                         */
+/* ========================================================================= */
+
+void low_power_sleep_configure(void)
+{
+	/* BMI160 INT1 pin — any-motion active-high pulse → wakeup */
+	gpio_wakeup_enable(LP_WAKEUP_GPIO, GPIO_INTR_HIGH_LEVEL);
+	esp_sleep_enable_gpio_wakeup();
+	ESP_LOGD(TAG, "light-sleep wakeup configured on GPIO %d",
+		 LP_WAKEUP_GPIO);
+}
+
+void low_power_sleep_enter(void)
+{
+	/* Enter Light-sleep; returns after any enabled wakeup source fires.
+	 * The BMI160 GPIO ISR (bmi160_motion_isr) runs before return,
+	 * so g_motion_flag / g_motion_sem are already set. */
+	esp_light_sleep_start();
+}
+
+void low_power_sleep_unconfigure(void)
+{
+	esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
+	gpio_wakeup_disable(LP_WAKEUP_GPIO);
+}
+
+void low_power_deep_sleep_enter(void)
+{
+	ESP_LOGI(TAG, ">> DEEP_SLEEP fallback (%u s no motion)",
+		 DEEP_SLEEP_FALLBACK_S);
+
+	/* RTC timer is the only reliable Deep-sleep wakeup on ESP32-C3
+	 * for non-RTC GPIOs.  GPIO %d (BMI160 INT1) is NOT an RTC GPIO,
+	 * so it cannot wake Deep-sleep — we rely on periodic RTC timer
+	 * wakeup to re-check the world. */
+	esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_FALLBACK_S *
+				      1000000ULL);
+
+	ESP_LOGI(TAG, "entering deep-sleep — see you in %u s",
+		 DEEP_SLEEP_FALLBACK_S);
+	esp_deep_sleep_start();
+	/* never reached */
 }
 
 /* ========================================================================= */
@@ -141,6 +189,120 @@ void upload_send_all(ct511n_handle_t *ct511n)
 	}
 
 	ESP_LOGI(TAG, "upload done — %lu sent, %lu failed", (unsigned long)sent, (unsigned long)failed);
+}
+
+/* ========================================================================= */
+/*  IMG_RECEIVE helpers                                                      */
+/* ========================================================================= */
+
+/** Handle to the ST7789 display (NULL until img_recv_enter). */
+static st7789_handle_t *g_display = NULL;
+
+/** W25Q64 handle passed via img_recv_enter, used by BLE callback. */
+static w25q64_handle_t *g_img_flash = NULL;
+
+/** Callback invoked by BLE component when image transfer is complete. */
+static int img_recv_on_ready(uint32_t total_bytes)
+{
+	if (g_display == NULL) return -1;
+
+	ESP_LOGI(TAG, "image received (%lu B) — displaying…", total_bytes);
+
+	if (total_bytes == 0) {
+		/* Re-display the last image already in Flash */
+		total_bytes = ST7789_LCD_WIDTH * ST7789_LCD_HEIGHT * 2;
+	}
+
+	/* Display the image from Flash onto the screen */
+	esp_err_t err = st7789_display_from_flash(g_display, 0,
+						  ST7789_LCD_WIDTH,
+						  ST7789_LCD_HEIGHT);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "display_from_flash: %s", esp_err_to_name(err));
+		return -1;
+	}
+
+	ESP_LOGI(TAG, "image displayed");
+	return 0;
+}
+
+esp_err_t img_recv_enter(spi_host_device_t host,
+			 w25q64_handle_t *flash_handle)
+{
+	esp_err_t err;
+
+	/* Store the flash handle for BLE callback */
+	g_img_flash = flash_handle;
+
+	/* ---- Initialise ST7789 display (SPI bus already init'd by W25Q64) ---- */
+	st7789_config_t disp_cfg = {
+		.host     = host,
+		.cs_gpio  = ST7789_CS_GPIO,
+		.dc_gpio  = ST7789_DC_GPIO,
+		.rst_gpio = ST7789_RST_GPIO,
+		.blk_gpio = ST7789_BLK_GPIO,
+		.freq_hz  = 40 * 1000 * 1000,  /* 40 MHz */
+	};
+	err = st7789_init(&g_display, &disp_cfg);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "st7789_init: %s", esp_err_to_name(err));
+		return err;
+	}
+
+	/* Clear screen to black */
+	st7789_fill_screen(g_display, 0x0000);
+
+	/* ---- Start BLE advertising ---- */
+	err = ble_img_init(img_recv_on_ready);
+	if (err != ESP_OK) {
+		ESP_LOGE(TAG, "ble_img_init: %s", esp_err_to_name(err));
+		st7789_destroy(g_display);
+		g_display = NULL;
+		return err;
+	}
+
+	/* ---- Redirect sensor records to RAM (avoid SPI conflict) ---- */
+	storage_set_ram_mode(true);
+	ESP_LOGI(TAG, "IMG_RECEIVE started — BLE advertising");
+
+	return ESP_OK;
+}
+
+void img_recv_exit(void)
+{
+	ESP_LOGI(TAG, "exiting IMG_RECEIVE");
+
+	/* Stop BLE */
+	ble_img_deinit();
+
+	/* Flush RAM-cached samples to Flash, restore normal mode */
+	storage_set_ram_mode(false);
+	esp_err_t flush_err = ram_cache_flush();
+	if (flush_err != ESP_OK) {
+		ESP_LOGW(TAG, "ram_cache_flush: %s", esp_err_to_name(flush_err));
+	}
+
+	/* Turn off display */
+	if (g_display != NULL) {
+		st7789_display_on(g_display, false);
+		st7789_destroy(g_display);
+		g_display = NULL;
+	}
+
+	g_img_flash = NULL;
+	ESP_LOGI(TAG, "IMG_RECEIVE done");
+}
+
+bool img_recv_poll(sensor_hub_t *hub, ct511n_handle_t *ct511n,
+		   uint32_t count)
+{
+	/* Sample sensors into RAM cache (called at 1s intervals) */
+	extern bool sample_sensors(sensor_hub_t *, ct511n_handle_t *,
+				   uint32_t);
+	sample_sensors(hub, ct511n, count);
+
+	/* Return false when BLE transfer is done */
+	return ble_img_is_busy();
 }
 
 /* ========================================================================= */

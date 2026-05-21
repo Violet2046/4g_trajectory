@@ -4,15 +4,47 @@
 #include <stdint.h>
 
 #include "driver/gptimer.h"
+#include "driver/spi_master.h"
 #include "esp_err.h"
+#include "esp_sleep.h"
 
 #include "CT511N.h"
 #include "W25Q64.h"
 #include "sensor_hub.h"
+#include "ST7789.h"
+#include "ble_img_rx.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ========================================================================= */
+/*  Constants                                                                */
+/* ========================================================================= */
+/** GPIO used for BMI160 any-motion interrupt (also used as sleep wakeup). */
+#define LP_WAKEUP_GPIO          9
+
+/* ---- SPI bus (shared between W25Q64 and ST7789) ---- */
+#define SPI_HOST                SPI2_HOST
+#define SPI_SCK_GPIO            2
+#define SPI_MOSI_GPIO           3
+#define SPI_MISO_GPIO           4
+
+/* W25Q64 SPI Flash */
+#define W25Q64_CS_GPIO          1
+
+/* ST7789 display */
+#define ST7789_CS_GPIO          11
+#define ST7789_DC_GPIO          12
+#define ST7789_RST_GPIO         13
+#define ST7789_BLK_GPIO         14
+
+/**
+ * Deep-sleep fallback timeout.
+ * If the system stays in low-power longer than this (no motion), it enters
+ * true Deep-sleep with only an RTC timer wakeup.  Set to 0 to disable.
+ */
+#define DEEP_SLEEP_FALLBACK_S   (30 * 60)   /* 30 minutes */
 
 /* ========================================================================= */
 /*  Timer helpers                                                            */
@@ -32,11 +64,79 @@ void low_power_exit(gptimer_handle_t timer,
 		    w25q64_handle_t *w25q64,
 		    sensor_hub_t *hub);
 
+/**
+ * @brief  Configure GPIO wakeup for Light-sleep.
+ *
+ * BMI160 INT1 (LP_WAKEUP_GPIO) is set as a wakeup source so that any-motion
+ * can wake the CPU from Light-sleep.  Call once on entry to LOW_POWER.
+ */
+void low_power_sleep_configure(void);
+
+/**
+ * @brief  Enter Light-sleep and wait for wakeup.
+ *
+ * CPU is halted; any-motion on GPIO LP_WAKEUP_GPIO (or any other enabled
+ * wakeup source) will resume execution.  The BMI160 ISR fires before this
+ * function returns.
+ */
+void low_power_sleep_enter(void);
+
+/**
+ * @brief  Tear down GPIO wakeup config after leaving LOW_POWER.
+ */
+void low_power_sleep_unconfigure(void);
+
+/**
+ * @brief  Enter Deep-sleep with RTC timer wakeup (fallback).
+ *
+ * This is a deeper sleep than Light-sleep — the chip reboots on wakeup.
+ * Caller should save any critical state beforehand.  This function never
+ * returns (calls esp_deep_sleep_start()).
+ */
+void low_power_deep_sleep_enter(void) __attribute__((noreturn));
+
 /* ========================================================================= */
 /*  Upload helpers                                                           */
 /* ========================================================================= */
 /** Upload all pending records from flash (or RAM fallback). */
 void upload_send_all(ct511n_handle_t *ct511n);
+
+/* ========================================================================= */
+/*  IMG_RECEIVE helpers — display + BLE image receive                       */
+/* ========================================================================= */
+
+/**
+ * @brief  Initialise the display (ST7789) and start BLE advertising.
+ *
+ * Called once when entering STATE_IMG_RECEIVE.  Registers an internal
+ * callback that displays the received image automatically.
+ *
+ * @param  host          SPI host used (shared with W25Q64)
+ * @param  flash_handle  W25Q64 handle (for image cache writes)
+ * @return ESP_OK on success.
+ */
+esp_err_t img_recv_enter(spi_host_device_t host,
+			 w25q64_handle_t *flash_handle);
+
+/**
+ * @brief  Exit IMG_RECEIVE: stop BLE, flush RAM cache, turn off display.
+ */
+void img_recv_exit(void);
+
+/**
+ * @brief  Perform one iteration of the IMG_RECEIVE polling loop.
+ *
+ * Must be called periodically from the main loop while in IMG_RECEIVE state.
+ * Keeps the watchdog fed and checks BLE state.  Returns false when the
+ * caller should transition back to STATE_ACTIVE.
+ *
+ * @param  hub     sensor hub (for sampling during image reception)
+ * @param  ct511n  CT511N handle (for GPS during image reception)
+ * @param  count   current sample count
+ * @return true if still receiving; false if image transfer is complete
+ */
+bool img_recv_poll(sensor_hub_t *hub, ct511n_handle_t *ct511n,
+		   uint32_t count);
 
 /* ========================================================================= */
 /*  Sample helpers                                                           */

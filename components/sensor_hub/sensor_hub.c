@@ -20,6 +20,8 @@ struct sensor_hub_t {
 
 	bmi160_handle_t  *bmi160;
 	ak09911_handle_t *ak09911;
+
+	bool double_tap_enabled;  /* INT2 double-tap configured? */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -98,8 +100,23 @@ esp_err_t sensor_hub_init(sensor_hub_t **out_hub,
 
 	ESP_LOGI(HUB_TAG, "BMI160 ready at 0x%02X", bmi_addrs[bmi_found]);
 
-	/* Configure any-motion interrupt */
+	/* Configure any-motion interrupt (→ INT1) */
 	bmi160_any_motion_configure(hub->bmi160, 0x06, 0x01);
+
+	/* Configure double-tap interrupt (→ INT2) if pin is assigned */
+	hub->double_tap_enabled = false;
+	if (config->bmi160_int2_pin != GPIO_NUM_NC &&
+	    config->bmi160_int2_type != GPIO_INTR_DISABLE) {
+		esp_err_t dt_err = bmi160_double_tap_configure(hub->bmi160);
+		if (dt_err == ESP_OK) {
+			hub->double_tap_enabled = true;
+			ESP_LOGI(HUB_TAG, "double-tap on INT2 (GPIO %d)",
+				 config->bmi160_int2_pin);
+		} else {
+			ESP_LOGW(HUB_TAG, "double-tap config: %s",
+				 esp_err_to_name(dt_err));
+		}
+	}
 
 	/* ---- AK09911C auto-detect ---- */
 	int mag_found = -1;
@@ -195,9 +212,12 @@ esp_err_t sensor_hub_sleep(sensor_hub_t *hub)
 	if (hub->bmi160 != NULL) {
 		bmi160_gyr_set_mode(hub->bmi160, BMI160_MODE_SUSPEND);
 		bmi160_acc_set_mode(hub->bmi160, BMI160_MODE_LOW_POWER);
-		/* Re-apply any-motion config after power mode change */
+		/* Re-apply any-motion + double-tap configs */
 		bmi160_any_motion_configure(hub->bmi160, 0x06, 0x01);
-		bmi160_int_map_set(hub->bmi160, 0x04, 0x00, 0x00);
+		uint8_t int_map_1 = hub->double_tap_enabled
+				    ? BMI160_INT_MAP_DOUBLE_TAP
+				    : 0x00;
+		bmi160_int_map_set(hub->bmi160, 0x04, int_map_1, 0x00);
 		ESP_LOGD(HUB_TAG, "BMI160 low-power + any-motion re-armed");
 	}
 

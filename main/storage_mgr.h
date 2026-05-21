@@ -191,6 +191,67 @@ uint32_t storage_capacity(void);
 /** @return Current sampling interval in seconds (from cached config). */
 uint32_t storage_sample_interval_s(void);
 
+/* ========================================================================= */
+/*  Image Cache Region (Flash second half: 0x400000 – 0x7FFFFF)             */
+/* ========================================================================= */
+#define IMG_CACHE_BASE_ADDR      0x400000
+#define IMG_CACHE_SIZE            0x400000   /* 4 MB */
+
+/**
+ * @brief  Erase the entire image cache region (sector-by-sector).
+ */
+esp_err_t img_cache_erase_all(void);
+
+/**
+ * @brief  Write data to the image cache region.
+ * @param  offset  byte offset within IMG_CACHE region (0 … IMG_CACHE_SIZE-1)
+ * @param  data    source buffer
+ * @param  len     number of bytes to write (must not cross 256B page boundary)
+ */
+esp_err_t img_cache_write(uint32_t offset, const uint8_t *data, size_t len);
+
+/**
+ * @brief  Read data from the image cache region.
+ * @param  offset  byte offset within IMG_CACHE region
+ * @param  data    destination buffer
+ * @param  len     number of bytes to read
+ */
+esp_err_t img_cache_read(uint32_t offset, uint8_t *data, size_t len);
+
+/**
+ * @brief  When enabled, storage_record_append() writes to RAM cache instead
+ *         of Flash.  Used during IMG_RECEIVE to avoid SPI bus contention.
+ *         Call ram_cache_flush() later to persist records to Flash.
+ */
+void storage_set_ram_mode(bool enable);
+
+/* ========================================================================= */
+/*  RAM Cache (used during IMG_RECEIVE to buffer samples)                   */
+/* ========================================================================= */
+#define RAM_CACHE_CAPACITY  512   /* 512 records × 256 B = 128 KB */
+
+/**
+ * @brief  Initialise or reset the RAM circular buffer.
+ */
+void ram_cache_init(void);
+
+/**
+ * @brief  Append a sensor record to the RAM cache.
+ * @return ESP_OK, or ESP_ERR_NO_MEM if full (oldest dropped).
+ */
+esp_err_t ram_cache_append(const storage_record_t *rec);
+
+/**
+ * @brief  Return the number of records currently in the RAM cache.
+ */
+uint32_t ram_cache_count(void);
+
+/**
+ * @brief  Flush all RAM-cached records to Flash (sensor data region).
+ *         After flush the RAM cache is emptied.
+ */
+esp_err_t ram_cache_flush(void);
+
 #ifdef __cplusplus
 }
 #endif
