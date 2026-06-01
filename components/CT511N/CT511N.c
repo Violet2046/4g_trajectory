@@ -165,6 +165,11 @@ esp_err_t ct511n_send_at_command(ct511n_handle_t *handle,
 		return ESP_ERR_TIMEOUT;
 	}
 
+	/* Flush stale URC / unsolicited data before sending a new command.
+	 * Without this, left-over messages (RDY, +CEREG, +CPIN etc.) from
+	 * module startup or previous operations contaminate the response. */
+	uart_flush_input(handle->config.uart_port);
+
 	written = uart_write_bytes(handle->config.uart_port, command, strlen(command));
 	if (written > 0) {
 		uart_write_bytes(handle->config.uart_port, "\r\n", 2);
@@ -659,7 +664,7 @@ esp_err_t ct511n_tcp_single_connect(ct511n_handle_t *handle, const char *ip, con
 	
 	s_tcp_target_ip = ip;
 	s_tcp_target_port = port;
-	err = reset(ct511n_4g_tcp_on_retry, handle, "CIPOPEN ok", 30, CT511N_RETRY_DELAY_MID_MS);
+	err = reset(ct511n_4g_tcp_on_retry, handle, "CIPOPEN ok", 10, CT511N_RETRY_DELAY_MID_MS);
 	if (err != ESP_OK) {
 		s_tcp_target_ip = NULL;
 		s_tcp_target_port = NULL;

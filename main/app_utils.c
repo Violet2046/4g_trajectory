@@ -47,10 +47,15 @@ void low_power_enter(gptimer_handle_t timer,
 		     w25q64_handle_t *w25q64,
 		     sensor_hub_t *hub)
 {
+	esp_err_t err;
 	ESP_LOGI(TAG, ">> LOW_POWER (no motion for 5 s)");
 	timer_stop(timer);
 	if (w25q64 != NULL) w25q64_power_down(w25q64);
-	sensor_hub_sleep(hub);
+	err = sensor_hub_sleep(hub);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "sensor_hub_sleep failed: %s — wakeup may not work",
+			 esp_err_to_name(err));
+	}
 	ESP_LOGI(TAG, "waiting for any-motion…");
 }
 
@@ -69,16 +74,18 @@ void low_power_exit(gptimer_handle_t timer,
 }
 
 /* ========================================================================= */
-/*  Light-sleep / Deep-sleep helpers                                         */
+/*  Low-power sleep helpers                                                  */
 /* ========================================================================= */
 
 void low_power_sleep_configure(void)
 {
-	/* BMI160 INT1 pin — any-motion active-high pulse → wakeup */
+	/* BMI160 INT1 pin — any-motion active-high pulse → wakeup.
+	 * gpio_wakeup_enable() is persistent; esp_sleep_enable_gpio_wakeup()
+	 * is consumed on each sleep entry and must be re-called before each
+	 * esp_light_sleep_start() in the LOW_POWER loop. */
 	gpio_wakeup_enable(LP_WAKEUP_GPIO, GPIO_INTR_HIGH_LEVEL);
-	esp_sleep_enable_gpio_wakeup();
-	ESP_LOGD(TAG, "light-sleep wakeup configured on GPIO %d",
-		 LP_WAKEUP_GPIO);
+	ESP_LOGI(TAG, "light-sleep wakeup configured on GPIO %d (HIGH_LEVEL)",
+		 (int)LP_WAKEUP_GPIO);
 }
 
 void low_power_sleep_enter(void)
@@ -93,24 +100,6 @@ void low_power_sleep_unconfigure(void)
 {
 	esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
 	gpio_wakeup_disable(LP_WAKEUP_GPIO);
-}
-
-void low_power_deep_sleep_enter(void)
-{
-	ESP_LOGI(TAG, ">> DEEP_SLEEP fallback (%u s no motion)",
-		 DEEP_SLEEP_FALLBACK_S);
-
-	/* RTC timer is the only reliable Deep-sleep wakeup on ESP32-C3
-	 * for non-RTC GPIOs.  GPIO %d (BMI160 INT1) is NOT an RTC GPIO,
-	 * so it cannot wake Deep-sleep — we rely on periodic RTC timer
-	 * wakeup to re-check the world. */
-	esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_FALLBACK_S *
-				      1000000ULL);
-
-	ESP_LOGI(TAG, "entering deep-sleep — see you in %u s",
-		 DEEP_SLEEP_FALLBACK_S);
-	esp_deep_sleep_start();
-	/* never reached */
 }
 
 /* ========================================================================= */
@@ -147,6 +136,15 @@ void upload_send_all(ct511n_handle_t *ct511n)
 	storage_config_t cfg;
 	storage_config_default(&cfg);
 	storage_config_read(&cfg);
+
+	/* Establish TCP connection before any send attempt.
+	 * Without this, all ct511n_4g_tcp_send() calls fail immediately because
+	 * no socket is open. */
+	err = ct511n_tcp_single_connect(ct511n, cfg.server_ip, cfg.server_port);
+	if (err != ESP_OK) {
+		ESP_LOGW(TAG, "TCP connect failed — upload skipped");
+		return;
+	}
 
 	/* Scan all pending flash records */
 	for (;;) {

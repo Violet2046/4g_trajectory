@@ -24,6 +24,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
 
 #include "CT511N.h"
@@ -31,30 +32,15 @@
 #include "sensor_hub.h"
 #include "storage_mgr.h"
 #include "app_utils.h"
+#include "pin_config.h"
 
 /* ======================================================================== */
-/*  Pin Definitions                                                         */
+/*  Timing Constants (non-pin)                                               */
 /* ======================================================================== */
-#define CT_UART_PORT           UART_NUM_1
-#define CT_UART_TX_PIN         5
-#define CT_UART_RX_PIN         6
-#define CT_UART_BAUD           115200
-#define CT_DTR_PIN             10
-
-#define I2C_SDA                7
-#define I2C_SCL                8
-#define BMI160_INT1_PIN        LP_WAKEUP_GPIO
-
-#define GPTIMER_RESOLUTION_HZ  1000000
-
 #define CT_WAKE_DELAY_MS       500
 #define INACTIVITY_TIMEOUT_MS  5000
 #define IDLE_POLL_MS           50
 #define LP_POLL_MS             200
-
-/* BMI160 INT2 pin for double-tap → IMG_RECEIVE mode.
- * Double-tap the device to enter IMG_RECEIVE. */
-#define BMI160_INT2_PIN         0
 
 /* ======================================================================== */
 /*  System State                                                            */
@@ -64,7 +50,6 @@ typedef enum {
 	STATE_ACTIVE,
 	STATE_LOW_POWER,
 	STATE_SAMPLE,
-	STATE_DEEP_SLEEP,           /* fallback: RTC timer wakeup only */
 	STATE_IMG_RECEIVE,          /* BLE image receive + display */
 } sys_state_t;
 
@@ -225,12 +210,10 @@ void app_main(void)
 {
 	ESP_LOGI(TAG, "=== 4G Trajectory Logger ===");
 
-	/* Detect wakeup source after Deep-sleep / Light-sleep */
+	/* Detect wakeup source after reset */
 	uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
-	if (wakeup_causes & BIT(ESP_SLEEP_WAKEUP_TIMER)) {
-		ESP_LOGI(TAG, "woke from DEEP_SLEEP (RTC timer)");
-	} else if (wakeup_causes & BIT(ESP_SLEEP_WAKEUP_GPIO)) {
-		ESP_LOGI(TAG, "woke from Light-sleep (GPIO any-motion)");
+	if (wakeup_causes & (1U << ESP_SLEEP_WAKEUP_GPIO)) {
+		ESP_LOGI(TAG, "woke from GPIO (BMI160 any-motion)");
 	} else {
 		ESP_LOGI(TAG, "cold boot (normal power-on or reset)");
 	}
@@ -285,67 +268,71 @@ void app_main(void)
 			break;
 
 		case STATE_LOW_POWER:
-			/* --- First entry: configure GPIO wakeup for Light-sleep --- */
-			{
-				static bool sleep_cfg_done = false;
-				if (!sleep_cfg_done) {
-					low_power_sleep_configure();
-					g_lp_enter_us = esp_timer_get_time();
-					sleep_cfg_done = true;
-				}
+	{
+		bmi160_handle_t *bmi = sensor_hub_get_bmi160(g_hub);
 
-				/* Motion ISR fired (GPIO wakeup or edge while awake) */
-				if (g_motion_flag) {
-					g_motion_flag = false;
-					sleep_cfg_done = false;
-					low_power_sleep_unconfigure();
-					low_power_exit(g_timer, g_ct511n,
-						       g_w25q64, g_hub);
-					g_state = STATE_SAMPLE;
-					break;
-				}
+		static bool entry_done = false;
+		static int  motion_hits = 0;
+		static int64_t motion_first_us = 0;
 
-				/* Poll INT_STATUS as backup (runs after timer wakeup) */
-				{
-					uint8_t istat[4];
-					bmi160_handle_t *bmi = sensor_hub_get_bmi160(g_hub);
-					if (bmi && bmi160_int_status_read(bmi, istat) == ESP_OK) {
-						if (istat[0] & 0x07) {
-							ESP_LOGI(TAG, "any-motion via poll wakeup");
-							sleep_cfg_done = false;
-							low_power_sleep_unconfigure();
-							low_power_exit(g_timer, g_ct511n,
-								       g_w25q64, g_hub);
-							g_state = STATE_SAMPLE;
-							break;
-						}
-					}
-				}
+		if (!entry_done) {
+			low_power_sleep_configure();
+			g_lp_enter_us = esp_timer_get_time();
+			motion_hits = 0;
+			motion_first_us = 0;
+			entry_done = true;
+		}
 
-				/* Deep-sleep fallback: no motion for too long */
-				if (DEEP_SLEEP_FALLBACK_S > 0) {
-					int64_t elapsed_us = esp_timer_get_time() - g_lp_enter_us;
-					if (elapsed_us > (int64_t)DEEP_SLEEP_FALLBACK_S * 1000000LL) {
-						ESP_LOGI(TAG, "no motion for %u s — deep-sleep",
-							 DEEP_SLEEP_FALLBACK_S);
-						sleep_cfg_done = false;
-						low_power_sleep_unconfigure();
-						g_state = STATE_DEEP_SLEEP;
-						break;
-					}
-				}
+		/* ---- Wait for motion: semaphore (ISR) or I2C poll ---- */
+		bool motion_detected = false;
+		int64_t now = 0;
 
-				/* --- Light-sleep until GPIO or 1 s timer wakeup --- */
-				esp_sleep_enable_timer_wakeup(1000000ULL);
-				low_power_sleep_enter();
-				/* wakeup: either motion (ISR set flag) or timer (poll above) */
+		if (xSemaphoreTake(g_motion_sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
+			motion_detected = true;
+			now = esp_timer_get_time();
+		}
+		/* Also check flag (ISR may fire right before/after sem take) */
+		if (g_motion_flag) {
+			motion_detected = true;
+			if (now == 0) now = esp_timer_get_time();
+		}
+		g_motion_flag = false;
+
+		/* I2C polling fallback */
+		if (!motion_detected && bmi) {
+			uint8_t istat[4];
+			if (bmi160_int_status_read(bmi, istat) == ESP_OK
+			    && (istat[0] & 0x07)) {
+				motion_detected = true;
+				now = esp_timer_get_time();
 			}
-			break;
+		}
 
-		case STATE_DEEP_SLEEP:
-			low_power_deep_sleep_enter();
-			/* never reached */
-			break;
+		/* ---- Debounce: 1st hit records time, 2nd hit ≥ 2s → EXIT ---- */
+		if (motion_detected) {
+			if (motion_hits == 0) {
+				motion_hits = 1;
+				motion_first_us = now;
+				ESP_LOGI(TAG, "motion #1 — waiting ≥2s for #2");
+			} else if ((now - motion_first_us) >= 2000000LL) {
+				ESP_LOGI(TAG, "motion #2 after %lld ms → EXIT",
+					 (now - motion_first_us) / 1000LL);
+				motion_hits = 0;
+				motion_first_us = 0;
+				entry_done = false;
+				low_power_sleep_unconfigure();
+				low_power_exit(g_timer, g_ct511n,
+					       g_w25q64, g_hub);
+				g_state = STATE_SAMPLE;
+				break;
+			}
+			/* < 2s → ignore, keep original first timestamp */
+		} else {
+			motion_hits = 0;
+			motion_first_us = 0;
+		}
+	}
+	break;
 
 		case STATE_IMG_RECEIVE: {
 			static bool img_init_done = false;
@@ -396,6 +383,7 @@ void app_main(void)
 			g_state = STATE_ACTIVE;
 			break;
 
+		case STATE_INIT:
 		default:
 			g_state = STATE_ACTIVE;
 			break;

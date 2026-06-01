@@ -21,30 +21,7 @@ extern "C" {
 /* ========================================================================= */
 /*  Constants                                                                */
 /* ========================================================================= */
-/** GPIO used for BMI160 any-motion interrupt (also used as sleep wakeup). */
-#define LP_WAKEUP_GPIO          9
-
-/* ---- SPI bus (shared between W25Q64 and ST7789) ---- */
-#define SPI_HOST                SPI2_HOST
-#define SPI_SCK_GPIO            2
-#define SPI_MOSI_GPIO           3
-#define SPI_MISO_GPIO           4
-
-/* W25Q64 SPI Flash */
-#define W25Q64_CS_GPIO          1
-
-/* ST7789 display */
-#define ST7789_CS_GPIO          11
-#define ST7789_DC_GPIO          12
-#define ST7789_RST_GPIO         13
-#define ST7789_BLK_GPIO         14
-
-/**
- * Deep-sleep fallback timeout.
- * If the system stays in low-power longer than this (no motion), it enters
- * true Deep-sleep with only an RTC timer wakeup.  Set to 0 to disable.
- */
-#define DEEP_SLEEP_FALLBACK_S   (30 * 60)   /* 30 minutes */
+#include "pin_config.h"
 
 /* ========================================================================= */
 /*  Timer helpers                                                            */
@@ -85,15 +62,6 @@ void low_power_sleep_enter(void);
  * @brief  Tear down GPIO wakeup config after leaving LOW_POWER.
  */
 void low_power_sleep_unconfigure(void);
-
-/**
- * @brief  Enter Deep-sleep with RTC timer wakeup (fallback).
- *
- * This is a deeper sleep than Light-sleep — the chip reboots on wakeup.
- * Caller should save any critical state beforehand.  This function never
- * returns (calls esp_deep_sleep_start()).
- */
-void low_power_deep_sleep_enter(void) __attribute__((noreturn));
 
 /* ========================================================================= */
 /*  Upload helpers                                                           */

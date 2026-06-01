@@ -187,7 +187,7 @@ esp_err_t w25q64_create(w25q64_handle_t **out_handle,
 		.address_bits     = 0,
 		.dummy_bits       = 0,
 		.queue_size       = 4,
-		.flags            = SPI_DEVICE_HALFDUPLEX,
+		.flags            = 0,  /* full-duplex; half-duplex flag conflicts with tx+rx transactions */
 	};
 
 	err = spi_bus_add_device(config->host, &dev_cfg, &handle->dev_handle);

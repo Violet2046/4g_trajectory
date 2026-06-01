@@ -121,8 +121,25 @@ esp_err_t bmi160_create(bmi160_handle_t **out_handle,
 		return err;
 	}
 
+	/* Always hardware reset the I2C peripheral first */
+	i2c_master_bus_reset(handle->bus_handle);
+	vTaskDelay(pdMS_TO_TICKS(10));
+
+	/* Soft-reset ALWAYS to guarantee clean state */
+	(void)bmi160_cmd(handle, BMI160_CMD_SOFT_RESET);
+	vTaskDelay(pdMS_TO_TICKS(50));
+
 	/* Verify chip ID */
-	err = bmi160_reg_read(handle, BMI160_CHIP_ID, &chip_id, 1);
+	for (int retry = 0; retry < 3; retry++) {
+		chip_id = 0;
+		err = bmi160_reg_read(handle, BMI160_CHIP_ID, &chip_id, 1);
+		if (err == ESP_OK && chip_id == BMI160_CHIP_ID_VAL) {
+			break;
+		}
+		ESP_LOGW(BMI160_TAG, "retry %d: chip_id=0x%02X err=%d", retry + 1, chip_id, err);
+		i2c_master_bus_reset(handle->bus_handle);
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
 	if ((err != ESP_OK) || (chip_id != BMI160_CHIP_ID_VAL)) {
 		ESP_LOGE(BMI160_TAG, "Bad chip_id: 0x%02X (expected 0x%02X)",
 			 chip_id, BMI160_CHIP_ID_VAL);
@@ -502,12 +519,12 @@ esp_err_t bmi160_any_motion_configure(bmi160_handle_t *handle,
 		return ESP_ERR_INVALID_ARG;
 	}
 
-	/* INT_MOTION_0 : any-motion threshold */
-	err = bmi160_reg_write(handle, BMI160_INT_MOTION_0, threshold);
+	/* INT_MOTION_0 (0x5F): any-motion duration (datasheet: anym_dur) */
+	err = bmi160_reg_write(handle, BMI160_INT_MOTION_0, duration);
 	if (err != ESP_OK) return err;
 
-	/* INT_MOTION_1 : any-motion duration */
-	err = bmi160_reg_write(handle, BMI160_INT_MOTION_1, duration);
+	/* INT_MOTION_1 (0x60): any-motion threshold (datasheet: anym_thr) */
+	err = bmi160_reg_write(handle, BMI160_INT_MOTION_1, threshold);
 	if (err != ESP_OK) return err;
 
 	/* Enable any-motion on X/Y/Z in INT_EN_0 */
@@ -737,6 +754,8 @@ esp_err_t bmi160_int2_pin_read(bmi160_handle_t *handle, int *level)
 /* ------------------------------------------------------------------------- */
 /*  ISR registration helpers                                                  */
 /* ------------------------------------------------------------------------- */
+static bool s_gpio_isr_installed = false;
+
 esp_err_t bmi160_int1_isr_add(bmi160_handle_t *handle,
 			      gpio_isr_t isr_handler,
 			      void *args)
@@ -748,7 +767,10 @@ esp_err_t bmi160_int1_isr_add(bmi160_handle_t *handle,
 		return ESP_ERR_NOT_SUPPORTED;
 	}
 
-	gpio_install_isr_service(0);
+	if (!s_gpio_isr_installed) {
+		gpio_install_isr_service(0);
+		s_gpio_isr_installed = true;
+	}
 	gpio_isr_handler_add(handle->config.int1_pin, isr_handler, args);
 	ESP_LOGI(BMI160_TAG, "ISR registered on INT1 pin GPIO_NUM_%d",
 		 (int)handle->config.int1_pin);
@@ -766,7 +788,10 @@ esp_err_t bmi160_int2_isr_add(bmi160_handle_t *handle,
 		return ESP_ERR_NOT_SUPPORTED;
 	}
 
-	gpio_install_isr_service(0);
+	if (!s_gpio_isr_installed) {
+		gpio_install_isr_service(0);
+		s_gpio_isr_installed = true;
+	}
 	gpio_isr_handler_add(handle->config.int2_pin, isr_handler, args);
 	ESP_LOGI(BMI160_TAG, "ISR registered on INT2 pin GPIO_NUM_%d",
 		 (int)handle->config.int2_pin);
@@ -849,8 +874,11 @@ esp_err_t bmi160_init(bmi160_handle_t **out_handle,
 	err = bmi160_int_map_set(handle, 0x04, 0x00, 0x00);
 	if (err != ESP_OK) goto fail;
 
-	/* 6.  INT1 output: active-high, push-pull  (int1_out_en=1, int1_lvl=1, int1_od=0) */
-	err = bmi160_int_out_ctrl_set(handle, 0x0A);
+	/* 6.  INT1 & INT2 output: active-high, push-pull 
+	 * int1_output_en=1(bit3), int1_lvl=1(bit1) -> 0x0A
+	 * int2_output_en=1(bit7), int2_lvl=1(bit5) -> 0xA0
+	 * Total = 0xAA */
+	err = bmi160_int_out_ctrl_set(handle, 0xAA);
 	if (err != ESP_OK) goto fail;
 
 	/* 7.  power on both sensors */
