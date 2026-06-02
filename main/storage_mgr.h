@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,7 +14,7 @@ extern "C" {
 /* ========================================================================= */
 /*  ROM Layout                                                               */
 /*                                                                           */
-/*  Sector 0 (pages 0-15, 4KB):  system area — config + index               */
+/*  Sector 0 (pages 0-15, 4KB):  system area  --  config + index               */
 /*    Pages 0-1   : Configuration (512 B)                                   */
 /*    Pages 2-7   : Index journal (1536 B)                                  */
 /*    Pages 8-15  : Reserved (future use, pad to sector boundary)           */
@@ -24,9 +24,9 @@ extern "C" {
 /*    Total: 32752 pages = 8,384,512 B ≈ 8 MB                              */
 /* ========================================================================= */
 #define STORAGE_CONFIG_START_PAGE   0
-#define STORAGE_CONFIG_PAGE_COUNT   2       /* 512 B  — configuration        */
+#define STORAGE_CONFIG_PAGE_COUNT   2       /* 512 B   --  configuration        */
 #define STORAGE_INDEX_START_PAGE    2
-#define STORAGE_INDEX_PAGE_COUNT    6       /* 1536 B — index journal        */
+#define STORAGE_INDEX_PAGE_COUNT    6       /* 1536 B  --  index journal        */
 #define STORAGE_RESERVED_START_PAGE 8       /* 8 pages reserved (pad to      */
 #define STORAGE_RESERVED_PAGE_COUNT 8       /*   sector boundary)            */
 #define STORAGE_DATA_START_PAGE     16      /* MUST be sector-aligned (16)   */
@@ -51,17 +51,19 @@ typedef struct {
 	char     server_ip[64];        /* e.g. "115.120.239.161"              */
 	char     server_port[8];       /* e.g. "27413"                        */
 	char     apn[32];              /* APN string, null-terminated          */
-	uint8_t  reserved[142];        /* pad to 254                           */
+	char     wifi_ssid[33];        /* WiFi SSID (32 + null)               */
+	char     wifi_password[65];    /* WiFi password (64 + null)           */
+	uint8_t  reserved[44];         /* pad to 254                           */
 	uint16_t crc16;                /* CRC-16 of bytes 0..253               */
 } __attribute__((packed)) storage_config_t;
 
 _Static_assert(sizeof(storage_config_t) == 256,
 	       "storage_config_t must be 256 bytes");
 
-/* Default configuration */
+/* Default configuration (pulled from main/config.h) */
 #define STORAGE_DEFAULT_SAMPLE_INTERVAL_S  1
-#define STORAGE_DEFAULT_SERVER_IP          "tcp.doiot.cn"
-#define STORAGE_DEFAULT_SERVER_PORT        "22962"
+#define STORAGE_DEFAULT_SERVER_IP          CFG_SERVER_IP_DEFAULT
+#define STORAGE_DEFAULT_SERVER_PORT        CFG_SERVER_PORT_STR
 #define STORAGE_DEFAULT_APN                ""
 
 /* ------------------------------------------------------------------------- */

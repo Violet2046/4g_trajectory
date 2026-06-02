@@ -166,6 +166,7 @@ esp_err_t ct511n_4g_build_payload(ct511n_handle_t *handle, char *payload, size_t
 esp_err_t ct511n_4g_dtu_on(ct511n_handle_t *handle);
 esp_err_t ct511n_4g_dtu_off(ct511n_handle_t *handle);
 esp_err_t ct511n_4g_tcp_stop(ct511n_handle_t *handle);
+esp_err_t ct511n_4g_net_close(ct511n_handle_t *handle);
 
 esp_err_t ct511n_reset(ct511n_handle_t *handle);
 esp_err_t ct511n_gps_on(ct511n_handle_t *handle);

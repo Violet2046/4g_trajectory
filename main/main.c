@@ -1,6 +1,6 @@
-/**
+﻿/**
  * @file    main.c
- * @brief   4G Trajectory Logger — state machine with low-power idle mode.
+ * @brief   4G Trajectory Logger  -- state machine with low-power idle mode.
  *
  * Architecture:
  *   - sensor_hub  : manages shared I2C bus, BMI160 (any-motion INT1), AK09911C
@@ -20,30 +20,25 @@
 
 #include "driver/gpio.h"
 #include "driver/gptimer.h"
-#include "driver/uart.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
 
 #include "CT511N.h"
 #include "W25Q64.h"
 #include "sensor_hub.h"
 #include "storage_mgr.h"
 #include "app_utils.h"
-#include "pin_config.h"
+#include "ble_img_rx.h"
+#include "config.h"
+#include "wifi_cfg.h"
 
 /* ======================================================================== */
-/*  Timing Constants (non-pin)                                               */
-/* ======================================================================== */
-#define CT_WAKE_DELAY_MS       500
-#define INACTIVITY_TIMEOUT_MS  5000
-#define IDLE_POLL_MS           50
-#define LP_POLL_MS             200
-
-/* ======================================================================== */
-/*  System State                                                            */
+/*  State Machine                                                           */
 /* ======================================================================== */
 typedef enum {
 	STATE_INIT = 0,
@@ -111,12 +106,12 @@ static esp_err_t hardware_init(void)
 
 	/* ---- CT511N UART ---- */
 	ct511n_uart_config_t ct_cfg = {
-		.uart_port   = CT_UART_PORT, .uart_num = CT_UART_PORT,
-		.tx_pin      = CT_UART_TX_PIN, .rx_pin = CT_UART_RX_PIN,
+		.uart_port   = CFG_CT_UART_PORT, .uart_num = CFG_CT_UART_PORT,
+		.tx_pin      = CFG_CT_UART_TX_PIN, .rx_pin = CFG_CT_UART_RX_PIN,
 		.rts_pin     = UART_PIN_NO_CHANGE, .cts_pin = UART_PIN_NO_CHANGE,
-		.dtr_pin     = CT_DTR_PIN,
+		.dtr_pin     = CFG_CT_DTR_PIN,
 		.uart_config = {
-			.baud_rate = CT_UART_BAUD, .data_bits = UART_DATA_8_BITS,
+			.baud_rate = CFG_CT_UART_BAUD, .data_bits = UART_DATA_8_BITS,
 			.parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
 			.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
 			.source_clk = UART_SCLK_DEFAULT,
@@ -134,10 +129,10 @@ static esp_err_t hardware_init(void)
 
 	/* ---- Sensor hub (I2C bus + BMI160 + AK09911C) ---- */
 	sensor_hub_config_t hub_cfg = {
-		.sda_io_num = I2C_SDA, .scl_io_num = I2C_SCL,
-		.bmi160_int1_pin = BMI160_INT1_PIN,
+		.sda_io_num = CFG_I2C_SDA, .scl_io_num = CFG_I2C_SCL,
+		.bmi160_int1_pin = CFG_BMI160_INT1_PIN,
 		.bmi160_int1_type = GPIO_INTR_POSEDGE,
-		.bmi160_int2_pin = BMI160_INT2_PIN,
+		.bmi160_int2_pin = CFG_BMI160_INT2_PIN,
 		.bmi160_int2_type = GPIO_INTR_POSEDGE,
 	};
 	err = sensor_hub_init(&g_hub, &hub_cfg);
@@ -151,26 +146,26 @@ static esp_err_t hardware_init(void)
 	g_motion_sem = xSemaphoreCreateBinary();
 	bmi160_int1_isr_add(sensor_hub_get_bmi160(g_hub), bmi160_motion_isr, NULL);
 
-	/* Register double-tap ISR (INT2) — triggers IMG_RECEIVE */
+	/* Register double-tap ISR (INT2)  -- triggers IMG_RECEIVE */
 	bmi160_int2_isr_add(sensor_hub_get_bmi160(g_hub),
 			    bmi160_double_tap_isr, NULL);
 
 	/* ---- W25Q64 SPI NOR Flash ---- */
 	{
 		w25q64_config_t flash_cfg = {
-			.host      = SPI_HOST,
-			.cs_gpio   = W25Q64_CS_GPIO,
-			.sck_gpio  = SPI_SCK_GPIO,
-			.mosi_gpio = SPI_MOSI_GPIO,
-			.miso_gpio = SPI_MISO_GPIO,
+			.host      = CFG_SPI_HOST,
+			.cs_gpio   = CFG_W25Q64_CS_GPIO,
+			.sck_gpio  = CFG_SPI_SCK_GPIO,
+			.mosi_gpio = CFG_SPI_MOSI_GPIO,
+			.miso_gpio = CFG_SPI_MISO_GPIO,
 			.wp_gpio   = -1,
 			.hold_gpio = -1,
 			.dma_chan  = SPI_DMA_CH_AUTO,
-			.freq_hz   = 26 * 1000 * 1000,  /* 26 MHz */
+			.freq_hz   = CFG_W25Q64_SPI_FREQ_HZ,
 		};
 		err = w25q64_init(&g_w25q64, &flash_cfg);
 		if (err != ESP_OK) {
-			ESP_LOGW(TAG, "W25Q64 init: %s — Flash disabled",
+			ESP_LOGW(TAG, "W25Q64 init: %s  -- Flash disabled",
 				 esp_err_to_name(err));
 			g_w25q64 = NULL;
 		} else {
@@ -186,7 +181,7 @@ static esp_err_t hardware_init(void)
 	gptimer_config_t tcfg = {
 		.clk_src = GPTIMER_CLK_SRC_DEFAULT,
 		.direction = GPTIMER_COUNT_UP,
-		.resolution_hz = GPTIMER_RESOLUTION_HZ,
+		.resolution_hz = CFG_GPTIMER_RESOLUTION_HZ,
 	};
 	err = gptimer_new_timer(&tcfg, &g_timer);
 	if (err != ESP_OK) { ESP_LOGE(TAG, "gptimer: %s", esp_err_to_name(err)); return err; }
@@ -195,11 +190,11 @@ static esp_err_t hardware_init(void)
 	gptimer_register_event_callbacks(g_timer, &cbs, NULL);
 	gptimer_enable(g_timer);
 
-	timer_start(g_timer, 1);  /* default 1 s interval */
+	timer_start(g_timer, CFG_SAMPLE_INTERVAL_S);
 	ct511n_sleep_dtr_enable(g_ct511n);
 	g_last_motion_us = esp_timer_get_time();
 
-	ESP_LOGI(TAG, "hardware init complete — CT511N asleep");
+	ESP_LOGI(TAG, "hardware init complete  -- CT511N asleep");
 	return ESP_OK;
 }
 
@@ -209,6 +204,14 @@ static esp_err_t hardware_init(void)
 void app_main(void)
 {
 	ESP_LOGI(TAG, "=== 4G Trajectory Logger ===");
+
+	/* Init NVS  -- required by WiFi and other subsystems */
+	esp_err_t nvs_err = nvs_flash_init();
+	if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+	    nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		nvs_flash_erase();
+		nvs_flash_init();
+	}
 
 	/* Detect wakeup source after reset */
 	uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
@@ -220,12 +223,16 @@ void app_main(void)
 
 	esp_err_t err = hardware_init();
 	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "hardware_init failed — HALTING");
+		ESP_LOGE(TAG, "hardware_init failed  -- HALTING");
 		while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
 	}
 
 	g_state = STATE_ACTIVE;
 	ESP_LOGI(TAG, "entering main loop");
+
+	/* ---- WiFi AP for device configuration ---- */
+	wifi_cfg_start(NULL);
+	ESP_LOGI(TAG, "WiFi AP '4G-Tracker' started  -- connect and visit http://192.168.4.1");
 
 	/* ================================================================== */
 	/*  Main State Machine                                                */
@@ -241,49 +248,65 @@ void app_main(void)
 				g_last_motion_us = esp_timer_get_time();
 			}
 
-			/* BMI160 double-tap → IMG_RECEIVE */
+			/* BMI160 double-tap  -- IMG_RECEIVE */
 			if (g_img_trigger_flag) {
 				g_img_trigger_flag = false;
 				g_state = STATE_IMG_RECEIVE;
 				break;
 			}
 
-			/* Inactivity timeout → LOW_POWER */
+			/* Inactivity timeout  -- LOW_POWER */
 			if ((esp_timer_get_time() - g_last_motion_us) >
-			    (INACTIVITY_TIMEOUT_MS * 1000LL)) {
+			    (CFG_INACTIVITY_TIMEOUT_MS * 1000LL)) {
 				low_power_enter(g_timer, g_ct511n,
 						g_w25q64, g_hub);
 				g_state = STATE_LOW_POWER;
 				break;
 			}
 
-			/* Timer → sample */
+			/* Timer  -- sample */
 			if (g_sample_flag) {
 				g_sample_flag = false;
 				g_state = STATE_SAMPLE;
 				break;
 			}
 
-			vTaskDelay(pdMS_TO_TICKS(IDLE_POLL_MS));
+			vTaskDelay(pdMS_TO_TICKS(CFG_IDLE_POLL_MS));
 			break;
 
 		case STATE_LOW_POWER:
 	{
 		bmi160_handle_t *bmi = sensor_hub_get_bmi160(g_hub);
 
+		enum { LP_DEEP_WAIT, LP_MODEM_WAIT } static lp_phase = LP_DEEP_WAIT;
 		static bool entry_done = false;
-		static int  motion_hits = 0;
 		static int64_t motion_first_us = 0;
 
 		if (!entry_done) {
+			lp_phase = LP_DEEP_WAIT;
 			low_power_sleep_configure();
 			g_lp_enter_us = esp_timer_get_time();
-			motion_hits = 0;
 			motion_first_us = 0;
 			entry_done = true;
 		}
 
-		/* ---- Wait for motion: semaphore (ISR) or I2C poll ---- */
+		/* ---- Phase: DEEP_WAIT  -- automatic light sleep via PM ---- */
+		if (lp_phase == LP_DEEP_WAIT) {
+			/* Block on semaphore.  PM + tickless-idle automatically
+			 * puts the CPU into hardware light sleep while waiting. */
+			if (xSemaphoreTake(g_motion_sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
+				ESP_LOGI(TAG, "motion #1 (GPIO wakeup)  -- MODEM_WAIT");
+				lp_phase = LP_MODEM_WAIT;
+				motion_first_us = esp_timer_get_time();
+				g_motion_flag = false;
+				break;
+			}
+			/* Timer expired  -- no motion, stay in DEEP_WAIT */
+			g_motion_flag = false;
+			break;
+		}
+
+		/* ---- Phase: MODEM_WAIT  -- CPU running, debounced wait ---- */
 		bool motion_detected = false;
 		int64_t now = 0;
 
@@ -291,14 +314,12 @@ void app_main(void)
 			motion_detected = true;
 			now = esp_timer_get_time();
 		}
-		/* Also check flag (ISR may fire right before/after sem take) */
 		if (g_motion_flag) {
 			motion_detected = true;
 			if (now == 0) now = esp_timer_get_time();
 		}
 		g_motion_flag = false;
 
-		/* I2C polling fallback */
 		if (!motion_detected && bmi) {
 			uint8_t istat[4];
 			if (bmi160_int_status_read(bmi, istat) == ESP_OK
@@ -308,16 +329,11 @@ void app_main(void)
 			}
 		}
 
-		/* ---- Debounce: 1st hit records time, 2nd hit ≥ 2s → EXIT ---- */
 		if (motion_detected) {
-			if (motion_hits == 0) {
-				motion_hits = 1;
-				motion_first_us = now;
-				ESP_LOGI(TAG, "motion #1 — waiting ≥2s for #2");
-			} else if ((now - motion_first_us) >= 2000000LL) {
-				ESP_LOGI(TAG, "motion #2 after %lld ms → EXIT",
+			if ((now - motion_first_us) >= 2000000LL) {
+				ESP_LOGI(TAG, "motion #2 after %lld ms  -- EXIT",
 					 (now - motion_first_us) / 1000LL);
-				motion_hits = 0;
+				lp_phase = LP_DEEP_WAIT;
 				motion_first_us = 0;
 				entry_done = false;
 				low_power_sleep_unconfigure();
@@ -326,9 +342,8 @@ void app_main(void)
 				g_state = STATE_SAMPLE;
 				break;
 			}
-			/* < 2s → ignore, keep original first timestamp */
 		} else {
-			motion_hits = 0;
+			lp_phase = LP_DEEP_WAIT;
 			motion_first_us = 0;
 		}
 	}
@@ -337,7 +352,7 @@ void app_main(void)
 		case STATE_IMG_RECEIVE: {
 			static bool img_init_done = false;
 			if (!img_init_done) {
-				esp_err_t err = img_recv_enter(SPI_HOST,
+				esp_err_t err = img_recv_enter(CFG_SPI_HOST,
 							       g_w25q64);
 				if (err != ESP_OK) {
 					ESP_LOGE(TAG, "img_recv_enter: %s",
@@ -373,7 +388,7 @@ void app_main(void)
 		}
 
 		case STATE_SAMPLE:
-			vTaskDelay(pdMS_TO_TICKS(CT_WAKE_DELAY_MS));
+			vTaskDelay(pdMS_TO_TICKS(CFG_CT_WAKE_DELAY_MS));
 
 			sample_sensors(g_hub, g_ct511n, g_sample_count++);
 

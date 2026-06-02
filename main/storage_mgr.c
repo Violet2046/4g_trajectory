@@ -1,9 +1,12 @@
 #include "storage_mgr.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_timer.h"  /* for esp_timer_get_time                           */
+
+#include "config.h"
 
 #define STORAGE_TAG "storage"
 

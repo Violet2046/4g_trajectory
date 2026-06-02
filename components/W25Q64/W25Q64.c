@@ -15,7 +15,7 @@
 #define W25Q64_TAG "W25Q64"
 
 /* Default busy-wait timeout after erase/program (ms) */
-#define W25Q64_DEF_TIMEOUT_MS  2000
+#define W25Q64_DEF_TIMEOUT_MS  5000
 /* Chip Erase max time is much longer */
 #define W25Q64_CHIP_ERASE_TIMEOUT_MS  120000
 
@@ -154,6 +154,24 @@ esp_err_t w25q64_create(w25q64_handle_t **out_handle,
 		gpio_set_level(config->hold_gpio, 1);  /* HOLD inactive high */
 	}
 
+	/* ---- Pre-init CS + release JTAG pins (GPIO 2,3,4 are JTAG on ESP32-C3) ---- */
+	gpio_reset_pin(config->sck_gpio);
+	gpio_reset_pin(config->mosi_gpio);
+	gpio_reset_pin(config->miso_gpio);
+	gpio_reset_pin(config->cs_gpio);
+
+	{
+		gpio_config_t cs_cfg = {
+			.pin_bit_mask = (1ULL << config->cs_gpio),
+			.mode         = GPIO_MODE_OUTPUT,
+			.pull_up_en   = GPIO_PULLUP_ENABLE,
+			.pull_down_en = GPIO_PULLDOWN_DISABLE,
+			.intr_type    = GPIO_INTR_DISABLE,
+		};
+		gpio_config(&cs_cfg);
+		gpio_set_level(config->cs_gpio, 1);
+	}
+
 	/* ---- Initialize SPI bus ---- */
 	spi_bus_config_t bus_cfg = {
 		.sclk_io_num     = config->sck_gpio,
@@ -176,12 +194,12 @@ esp_err_t w25q64_create(w25q64_handle_t **out_handle,
 
 	/* ---- Add device ---- */
 	spi_device_interface_config_t dev_cfg = {
-		.mode             = 0,  /* SPI Mode 0 (CPOL=0, CPHA=0) */
+		.mode             = 3,  /* SPI Mode 3 (CPOL=1, CPHA=1) — stable on ESP32-C3 */
 		.clock_source     = SPI_CLK_SRC_DEFAULT,
 		.clock_speed_hz   = config->freq_hz,
-		.duty_cycle_pos   = 128,  /* 50% duty cycle */
-		.cs_ena_pretrans  = 0,
-		.cs_ena_posttrans = 0,
+		.duty_cycle_pos   = 128,
+		.cs_ena_pretrans  = 2,  /* CS setup time */
+		.cs_ena_posttrans = 2,  /* CS hold time */
 		.spics_io_num     = config->cs_gpio,
 		.command_bits     = 0,
 		.address_bits     = 0,
@@ -244,9 +262,10 @@ esp_err_t w25q64_init(w25q64_handle_t **out_handle,
 		ESP_LOGE(W25Q64_TAG, "JEDEC ID read failed");
 		goto fail;
 	}
-	if (mfr != W25Q64_MFR_ID) {
-		ESP_LOGE(W25Q64_TAG, "Bad manufacturer ID: 0x%02X (expected 0x%02X)",
-			 mfr, W25Q64_MFR_ID);
+	if (mfr != W25Q64_MFR_ID && mfr != W25Q64_MFR_ID_MICRON) {
+		ESP_LOGI(W25Q64_TAG, "JEDEC ID: %02X %02X %02X (Winbond=%02X, Micron=%02X)",
+			 mfr, (dev >> 8) & 0xFF, dev & 0xFF,
+			 W25Q64_MFR_ID, W25Q64_MFR_ID_MICRON);
 		err = ESP_ERR_NOT_FOUND;
 		goto fail;
 	}
@@ -305,10 +324,10 @@ esp_err_t w25q64_wait_busy(w25q64_handle_t *handle, uint32_t timeout_ms)
 
 	while (elapsed < timeout_ms) {
 		err = w25q64_cmd_rx(handle, W25Q64_CMD_READ_STATUS1, &sr1, 1);
-		if (err != ESP_OK) return err;
-		if (!(sr1 & W25Q64_SR1_BUSY)) return ESP_OK;
-		vTaskDelay(pdMS_TO_TICKS(1));
-		elapsed++;
+		if (err == ESP_OK && !(sr1 & W25Q64_SR1_BUSY)) return ESP_OK;
+		/* If SPI read fails (flash busy), just wait and retry */
+		vTaskDelay(pdMS_TO_TICKS(10));
+		elapsed += 10;
 	}
 
 	return ESP_ERR_TIMEOUT;

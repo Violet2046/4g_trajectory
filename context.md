@@ -1,81 +1,23 @@
-# 项目上下文 — 4G Trajectory
-
-> 生成日期: 2026-05-21
-> IDE: VS Code + ESP-IDF v6.0
-> 目标芯片: ESP32-C3
-> 构建系统: CMake / Ninja
-
----
-
-## 1. 项目概述
-本项目为一个基于 ESP32-C3 平台的 4G 轨迹追踪系统。主要利用 CT511N (4G+GPS 模块) 获取并发送定位数据，同时利用 BMI160 传感器获取设备的运动姿态及加速度信息，用于后续的轨迹姿态融合分析及低功耗唤醒管理。
-
-新增功能：通过 BLE 接收手机传输的图像，存入 Flash 后半区，并在 ST7789 显示屏（240×240 RGB565）上显示。图像接收期间传感器采样不中断（RAM 缓存临时存储）。
-
-## 2. 核心模块与技术栈
-
-### 2.1 主控芯片与环境
-- **主控芯片**: ESP32-C3 (RISC-V 核心)
-- **开发框架**: ESP-IDF v6.0。严格遵守最新 V6 API 开发底层外设驱动。
-- **系统架构**: FreeRTOS。采用 Task, Mutex 和 vTaskDelay 等机制实现并发与非阻塞系统。
-- **蓝牙栈**: NimBLE (ESP-IDF 内置)
-
-### 2.2 CT511N 模块 (4G & GPS)
-- **休眠控制**: 使用 dtr_pin，支持 `ct511n_sleep_dtr_enable()` 进行硬件级低功耗唤醒。
-
 ### 2.3 BMI160 模块 (六轴 IMU)
 - **通信接口**: I2C (ESP-IDF v6 `i2c_new_master_bus`)。
-- **中断控制**: INT1 (GPIO 20) 配置为上升沿触发，绑定 **AnyMotion** 运动唤醒；INT2 (GPIO 0) 配置为双击检测。
-- **Light-sleep 唤醒**: GPIO 20（即 BMI160 INT1）同时配置为 Light-sleep 唤醒源。
-
-### 2.4 AK09911C 模块 (3轴磁力计)
-- **通信接口**: I2C，共享总线。
-
-### 2.5 W25Q64 模块 (64M-bit NOR Flash) — 已启用
-- **通信接口**: SPI (SPI2_HOST, Mode 0)，共享总线。
-- **容量**: 8 MB，分为两个 4MB 分区：
-  - **前半区** (`0x000000`–`0x3FFFFF`): 传感器采样数据环形缓冲区
-  - **后半区** (`0x400000`–`0x7FFFFF`): 图像缓存区 (JPEG/RGB565)
-- **引脚**: CS=GPIO1, SCK=GPIO2, MOSI=GPIO3, MISO=GPIO4
-- **当前状态**: 已在 `hardware_init()` 中启用并初始化，`storage_mgr` 提供双分区 API。
-
-### 2.6 ST7789 显示模块 (240×240 RGB LCD)
-- **通信接口**: SPI (SPI2_HOST, Mode 3)，共享总线，40 MHz
-- **像素格式**: RGB565 (16-bit, 每像素 2 字节)
-- **引脚**: CS=GPIO11, DC=GPIO12, RST=GPIO13, BLK=GPIO14
-- **功能**: 全屏填充、窗口绘制、从 Flash 图像区直接读取并显示
-
-### 2.7 BLE 图像接收模块
-- **协议**: NimBLE GATT Server，自定义 128-bit UUID 服务
-- **特征**:
-  - `DATA` (Write): 接收图像数据块 (最大 512 字节/包)
-  - `CTRL` (Write): 控制命令 (START/DATA/DONE/CANCEL/DISPLAY)
-- **控制协议**:
-  - `IMG_CMD_START` (0x01): 启动传输，后跟 4 字节总大小
-  - `IMG_CMD_DONE` (0x03): 传输完成，触发自动显示
-  - `IMG_CMD_DISPLAY` (0x05): 重新显示上一张图片
-- **图像格式**: 原始 RGB565 数据 (240×240 = 115,200 字节)
+- **中断控制**: INT1 (GPIO 9) 配置为上升沿触发，绑定 **AnyMotion** 运动唤醒；INT2 (GPIO 0) 配置为双击检测 → IMG_RECEIVE。
+- **低功耗唤醒**: GPIO 9（即 BMI160 INT1）同时配置为唤醒源，PM tickless-idle 自动进入 light sleep。
 
 ### 2.8 主程序工作流（当前状态机）
 ```raw
 INIT → ACTIVE → SAMPLE → ACTIVE
-         ↕ (5s无运动)   ↕ (BOOT键)
+         ↕ (5s无运动)   ↕ (双击)
      LOW_POWER       IMG_RECEIVE
-         ↓ (30min)
-     DEEP_SLEEP
 ```
 #### 状态说明
 
 | 状态 | 行为 |
 |------|------|
-| **STATE_INIT** | `hardware_init()`: 初始化 CT511N、sensor_hub、W25Q64、gptimer、ISR、BOOT按键 |
+| **STATE_INIT** | `hardware_init()`: 初始化 CT511N、sensor_hub、W25Q64、gptimer、ISR |
 | **STATE_ACTIVE** | 等待 1s 定时器采样、AnyMotion 中断、或 BMI160 双击 (INT2 → IMG_RECEIVE) |
-| **STATE_LOW_POWER** | 传感器休眠、CPU Light-sleep、30min 后备 Deep-sleep |
+| **STATE_LOW_POWER** | 传感器休眠、PM tickless-idle 自动 light sleep、信号量 + 运动 ISR 唤醒 |
 | **STATE_SAMPLE** | 唤醒 CT511N → GPS → 传感器 → 存 Flash (或 RAM 缓存) → 上传 |
 | **STATE_IMG_RECEIVE** | BLE 广播 → 手机连接 → 接收图像写入 Flash 后半区 → 自动显示 → 退出 |
-| **STATE_DEEP_SLEEP** | `esp_deep_sleep_start()` (RTC 定时器唤醒) |
-
-## 3. 文件结构
 ```raw
 4g_trajectory/
 ├── CMakeLists.txt
@@ -83,7 +25,7 @@ INIT → ACTIVE → SAMPLE → ACTIVE
 │   ├── CMakeLists.txt          # REQUIRES: ... ST7789 ble_img_rx
 │   ├── main.c                  # 状态机 (~350行)
 │   ├── app_utils.h/.c          # 工具函数 + IMG_RECEIVE 辅助
-│   ├── pin_config.h            # 所有引脚定义统一入口
+│   ├── config.h                # 所有可配置参数统一入口（引脚、时序、网络）
 │   ├── storage_mgr.h/.c        # 双分区 + RAM Cache
 ├── components/
 │   ├── CT511N/                 # 4G+GPS (UART)
@@ -91,8 +33,9 @@ INIT → ACTIVE → SAMPLE → ACTIVE
 │   ├── AK09911C/               # 3轴磁力计 (I2C)
 │   ├── W25Q64/                 # NOR Flash (SPI, 已启用)
 │   ├── sensor_hub/             # 传感器管理中间层
-│   ├── ST7789/                 # 240×240 LCD 驱动 (SPI) ★ 新增
-│   └── ble_img_rx/             # BLE 图像接收服务 (NimBLE) ★ 新增
+│   ├── ST7789/                 # 240×240 LCD 驱动 (SPI)
+│   ├── ble_img_rx/             # BLE 图像接收服务 (NimBLE)
+│   └── wifi_cfg/               # WiFi 配网 + TCP 发送
 ```
 ---
 > **以上为项目参考文档（概览、模块、文件结构）—— 修改工作区后请同步更新。**
@@ -233,3 +176,114 @@ INIT → ACTIVE → SAMPLE → ACTIVE
     - `bmi160_any_motion_configure()` 阈值/持续时间寄存器交换修复。
     - `sensor_hub_sleep()` 所有 I2C 步骤增加错误检查和日志。
     - `esp_sleep_get_wakeup_causes()` 位掩码替代已弃用的 `esp_sleep_get_wakeup_cause()`。
+### 2026-06-02 Light Sleep 文档实现 + WiFi 配网
+
+40. **按 ESP-IDF 文档实现 Light Sleep**:
+    - `low_power_sleep_enter()`: 每次调用前执行 `esp_sleep_enable_gpio_wakeup()` + `esp_sleep_enable_timer_wakeup(1s)`，然后 `esp_light_sleep_start()`。符合文档要求的 gpio_wakeup_enable → sleep_enable_gpio → light_sleep_start 三步流程。
+    - LOW_POWER 两阶段：
+      - **DEEP_WAIT**: 真正硬件 light sleep，CPU 断电。BMI160 INT1 触发 → GPIO 唤醒 → `esp_sleep_get_wakeup_causes()` 检测 → 确认运动 #1。
+      - **MODEM_WAIT**: CPU 运行，`xSemaphoreTake(1s)` 等待。≥ 2s 后第二次运动 → 退出 LOW_POWER。若无运动 → 回退 DEEP_WAIT。
+
+41. **新增 WiFi 配网组件 `wifi_cfg`**:
+    - SoftAP SSID: `4G-Tracker`，密码 `12345678`。
+    - HTTP 服务器端口 80，访问 `http://192.168.4.1` 进行配网。
+    - 配置项：WiFi SSID/密码（可选）、服务器 IP/端口。
+    - 提交后回调通知主程序，TCP 连接自动使用配置的服务器地址。
+### 2026-06-02 修复：切回 PM 自动 sleep + NVS 初始化
+
+42. **`esp_light_sleep_start()` 在 v6.0 上再次确认无法返回**，切回 PM + tickless-idle 自动 sleep：
+    - DEEP_WAIT 阶段改用 `xSemaphoreTake(g_motion_sem, 1s)` + PM 自动 light sleep。
+    - BMI160 ISR → 信号量 → CPU 唤醒 → phase 切换到 MODEM_WAIT。
+43. **WiFi NVS 缺失修复**：`app_main()` 开头添加 `nvs_flash_init()`（含 erase 兜底），解决 `wifi osi_nvs_open fail ret=4353`。
+### 2026-06-02 `config.h` 统一配置文件
+
+44. **`pin_config.h` → `config.h`**，集中所有可配置参数：
+    - 硬件引脚（UART/I2C/SPI/BMI160/ST7789/W25Q64）
+    - 时序参数（GPTIMER 分辨率、低功耗超时、防抖间隔）
+    - BMI160 运动阈值
+    - WiFi AP SSID/密码/最大连接数
+    - 服务器 IP/端口（同时用于 4G TCP 和 WiFi 配网）
+    - 保留旧名称作为向后兼容别名，无需修改已有代码
+    - `storage_mgr.c` 改用 `CFG_SERVER_PORT_DEFAULT`（snprintf 格式化）
+### 2026-06-02 WiFi STA 连接 + 连通性测试 + Flash 存储
+
+45. **WiFi 配网增强**:
+    - 用户提交 SSID/密码后，ESP32 自动切换到 AP+STA 模式连接目标 WiFi。
+    - 连接成功后通过 `getaddrinfo` + TCP connect 到 `CFG_PING_TARGET`（默认 `baidu.com:80`）验证外网连通性。
+    - 结果页面实时显示：WiFi 连接状态 ✅/❌、连通性测试 ✅/❌。
+    - `storage_config_t` 新增 `wifi_ssid[33]` 和 `wifi_password[65]` 字段，配网信息持久化存入 SPI Flash。
+    - `config.h` 新增 `CFG_PING_TARGET`、`CFG_PING_PORT`、`CFG_WIFI_STA_CONNECT_TIMEOUT_MS`。
+### 2026-06-02 `ct511n_4g_net_close()` 函数 + 编译依赖修复
+
+46. **新增 `ct511n_4g_net_close()`**:
+    - CT511N 模块新增关闭 4G 数据网络的完整函数，分三步：
+      1. 退出透传模式（`+++`）
+      2. 关闭 TCP 连接（`AT+CIPCLOSE=1`）
+      3. 关闭数据网络 PDP 上下文（`AT+NETCLOSE`）
+    - 该函数用于 WiFi 连接成功后关闭 4G 数据，避免蜂窝网络占用和功耗浪费。
+    - 声明在 `CT511N.h`，实现在 `CT511N.c`。
+
+47. **`wifi_cfg` 组件编译依赖修复**:
+    - `wifi_cfg.c` 包含 `config.h` 间接引用 `driver/gpio.h`、`driver/spi_master.h`、`driver/uart.h`，以及 `storage_mgr.h` 间接引用 `W25Q64.h`。
+    - `wifi_cfg/CMakeLists.txt` 的 `REQUIRES` 补充：`esp_driver_gpio`、`esp_driver_spi`、`esp_driver_uart`、`W25Q64`。
+### 2026-06-02 WiFi 优先发送 + 4G 自动禁用
+
+46. **WiFi 连接后优先通过 WiFi 发送 payload**:
+    - `upload_send_all()` 开头检查 `wifi_cfg_is_sta_connected()`。
+    - WiFi 在线 → 禁用 4G（`ct511n_sleep_dtr_enable`），用 `wifi_cfg_tcp_send()` 通过 lwip socket 直连服务器发送。
+    - WiFi 离线 → 回退 4G CT511N 发送（原有逻辑）。
+    - `wifi_cfg` 新增 `wifi_cfg_is_sta_connected()` 和 `wifi_cfg_tcp_send()` API。
+### 2026-06-02 SPI Flash 适配 + 统一配置 + WiFi 自动连接
+
+47. **W25Q64 驱动程序兼容 Micron Flash (JEDEC 0x20 70 17)**:
+    - 放宽制造商 ID 校验：接受 Winbond (0xEF) 和 Micron (0x20)。
+    - SPI 引脚调整：SCK=3, MOSI=4, MISO=2, CS=1（ESP32-C3）。
+    - SPI Mode 0→3，增加 CS 预初始化（pull-up + 输出高电平），`gpio_reset_pin()` 释放 JTAG 占用。
+    - 关闭 `CONFIG_ESP_DEBUG_OCDAWARE` 和 `CONFIG_ESP32C3_DEBUG_OCDAWARE`，释放 GPIO 2/3/4。
+    - 时钟降至 10 MHz（面包板稳定）。
+
+48. **服务器配置统一到 SPI Flash**:
+    - 移除 `wifi_cfg` 中的 `g_server_ip`/`g_server_port` 局部变量。
+    - WiFi 配网通过 `server_save()` 写入 SPI Flash，4G 通过 `storage_config_read()` 读取同一份配置。
+    - 优先级：SPI Flash 存储值 → `config.h` 默认值。
+    - `upload_send_all()` WiFi 路径使用 `wifi_cfg_get_server_ip/port()`（即 flash 值），4G 路径读 `storage_config_read()`。
+
+49. **WiFi 开机自动连接**:
+    - `wifi_cfg_start()` 初始化后从 SPI Flash 读取已存储的 SSID/密码，有则自动 STA 连接。
+
+50. **修复 `sleep: Incorrect wakeup source` 错误**:
+    - `low_power_sleep_unconfigure()` 移除不再需要的 `esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO)`（因已不用 `esp_light_sleep_start()`）。
+
+### 2026-06-02 代码精简重构
+
+51. **删除 `main/pin_config.h`**:
+    - 该文件已完全冗余，所有引脚定义已在 `config.h` 中以 `CFG_` 前缀统一管理。
+
+52. **`config.h` 去掉向后兼容别名**:
+    - 移除 22 行旧别名宏（`CT_UART_PORT` → `CFG_CT_UART_PORT` 等）。
+    - 所有源文件（`main.c`、`app_utils.c`、`app_utils.h`）直接使用 `CFG_` 前缀宏。
+    - 移除不必要的 `#include "driver/gpio.h"`。
+    - 新增 SPI 频率常量 `CFG_W25Q64_SPI_FREQ_HZ` / `CFG_ST7789_SPI_FREQ_HZ`。
+
+53. **删除死代码**:
+    - 移除 `low_power_sleep_enter()` 函数（声明 + 实现），该函数从未被调用。
+
+54. **头文件清理**:
+    - `app_utils.h`: 移除 `esp_sleep.h`、`ST7789.h`、`ble_img_rx.h`（仅在 .c 中使用）。
+    - `app_utils.c`: 移除 `esp_sleep.h`，补充 `ST7789.h`、`ble_img_rx.h`。
+    - `main.c`: 移除 `driver/uart.h`（已在 `config.h` 中包含），补充 `esp_sleep.h`、`ble_img_rx.h`。
+
+55. **代码格式整理**:
+    - 统一换行符为 CRLF，去除冗余空行。
+    - 将所有 Unicode 特殊字符（em dash `—`）替换为 ASCII ` -- `，避免编码问题。
+### 2026-06-02 SPI Flash 写入超时修复
+
+51. **`storage_config_write()` 返回 `ESP_ERR_TIMEOUT (263)`**:
+    - **根因**: Micron Flash 扇区擦除时间超过 `W25Q64_DEF_TIMEOUT_MS`（原 2s），`w25q64_wait_busy()` 在擦除完成前超时返回。
+    - **修复**: 超时从 2s → 5s；等待循环中 SPI 读状态寄存器失败时不再立即返回错误，改为 delay 10ms 后重试。避免 Flash 忙时不响应 SPI 命令导致假超时。
+    - **验证**: `server_save: x.x.x.x:port → flash (err=0)` 确认写入成功。4G TCP 连接使用配网设置的 IP/端口。
+### 2026-06-02 config.h 补充采样间隔和 SPI 频率
+
+52. **`config.h` 新增**:
+    - `CFG_SAMPLE_INTERVAL_S` (1s)：传感器采样周期，替换 `main.c` 中硬编码。
+    - `CFG_W25Q64_SPI_FREQ_HZ` (10 MHz)：SPI Flash 时钟频率，统一到配置文件。

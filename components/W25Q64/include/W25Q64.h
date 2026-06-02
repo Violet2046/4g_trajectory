@@ -61,6 +61,7 @@ extern "C" {
 /*  JEDEC ID                                                                  */
 /* ------------------------------------------------------------------------- */
 #define W25Q64_MFR_ID                 0xEF  /*  Winbond                         */
+#define W25Q64_MFR_ID_MICRON           0x20  /*  Micron / ST                     */
 #define W25Q64_DEVICE_ID              0x4017 /* IQ/JQ variant (QE=1 default)     */
 #define W25Q64_JEDEC_ID_BYTES         3
 

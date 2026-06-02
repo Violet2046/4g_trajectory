@@ -754,6 +754,43 @@ esp_err_t ct511n_4g_tcp_stop(ct511n_handle_t *handle){
 	return ESP_FAIL;
 }
 
+esp_err_t ct511n_4g_net_close(ct511n_handle_t *handle)
+{
+	esp_err_t err;
+
+	if (handle == NULL) {
+		return ESP_ERR_INVALID_ARG;
+	}
+
+	ESP_LOGI(CT511N_TAG, "closing 4G data network...");
+
+	/* Step 1: exit transparent data mode if still in DTU mode */
+	(void)ct511n_4g_dtu_off(handle);
+	vTaskDelay(pdMS_TO_TICKS(CT511N_RETRY_DELAY_SHORT_MS));
+
+	/* Step 2: close TCP connection */
+	err = ct511n_4g_tcp_stop(handle);
+	if (err != ESP_OK) {
+		ESP_LOGW(CT511N_TAG, "TCP close failed (ignored)");
+	}
+
+	/* Step 3: close the data network (PDP context) */
+	err = ct511n_send_at_command(handle, CT511N_AT_CMD_NETCLOSE,
+				     handle->at_buf, sizeof(handle->at_buf),
+				     CT511N_RETRY_DELAY_MID_MS, NULL);
+	if (err != ESP_OK) {
+		ESP_LOGE(CT511N_TAG, "NETCLOSE failed: %s", esp_err_to_name(err));
+		return err;
+	}
+	if (strstr(handle->at_buf, "SUCCESS") != NULL ||
+	    strstr(handle->at_buf, "CLOSE OK") != NULL) {
+		ESP_LOGI(CT511N_TAG, "4G data network closed");
+		return ESP_OK;
+	}
+	ESP_LOGW(CT511N_TAG, "NETCLOSE unexpected rsp: %s", handle->at_buf);
+	return ESP_FAIL;
+}
+
 esp_err_t ct511n_reset(ct511n_handle_t *handle){
 	esp_err_t err = ct511n_send_at_command(handle, CT511N_AT_CMD_RESET, handle->at_buf, sizeof(handle->at_buf), CT511N_RETRY_DELAY_MID_MS, NULL);
 	if (err != ESP_OK) {
