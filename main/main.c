@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file    main.c
  * @brief   4G Trajectory Logger  -- state machine with low-power idle mode.
  *
@@ -22,6 +22,7 @@
 #include "driver/gptimer.h"
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
 #include "esp_task_wdt.h"
@@ -33,8 +34,11 @@
 #include "sensor_hub.h"
 #include "storage_mgr.h"
 #include "app_utils.h"
+#ifdef CONFIG_BT_NIMBLE_ENABLED
 #include "ble_img_rx.h"
+#endif
 #include "config.h"
+#include "epd_qyeg0397.h"
 #include "wifi_cfg.h"
 
 /* ======================================================================== */
@@ -139,6 +143,7 @@ static esp_err_t hardware_init(void)
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "sensor_hub_init: %s", esp_err_to_name(err));
 		ct511n_destroy(g_ct511n);
+		LOG_MEM_AFTER(TAG, "ct511n_destroy (error path)");
 		return err;
 	}
 
@@ -205,14 +210,13 @@ void app_main(void)
 {
 	ESP_LOGI(TAG, "=== 4G Trajectory Logger ===");
 
-	/* Init NVS  -- required by WiFi and other subsystems */
+/* Init NVS  -- required by WiFi and other subsystems */
 	esp_err_t nvs_err = nvs_flash_init();
 	if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
 	    nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 		nvs_flash_erase();
 		nvs_flash_init();
 	}
-
 	/* Detect wakeup source after reset */
 	uint32_t wakeup_causes = esp_sleep_get_wakeup_causes();
 	if (wakeup_causes & (1U << ESP_SLEEP_WAKEUP_GPIO)) {
@@ -221,6 +225,7 @@ void app_main(void)
 		ESP_LOGI(TAG, "cold boot (normal power-on or reset)");
 	}
 
+	/* Hardware init (SPI, UART, I2C, sensors, Flash, timer) */
 	esp_err_t err = hardware_init();
 	if (err != ESP_OK) {
 		ESP_LOGE(TAG, "hardware_init failed  -- HALTING");
@@ -230,34 +235,163 @@ void app_main(void)
 	g_state = STATE_ACTIVE;
 	ESP_LOGI(TAG, "entering main loop");
 
-	/* ---- WiFi AP for device configuration ---- */
-	wifi_cfg_start(NULL);
-	ESP_LOGI(TAG, "WiFi AP '4G-Tracker' started  -- connect and visit http://192.168.4.1");
+	/* ---- EPD display (shared SPI bus with W25Q64) ---- */
+	if (g_w25q64 != NULL) {
+		esp_err_t err = epd_app_init(CFG_SPI_HOST, g_w25q64);
+		if (err != ESP_OK) {
+			ESP_LOGW(TAG, "EPD init failed — continuing without EPD");
+		}
+	}
+
+	/* ---- Phase 1: WiFi STA-only (clean heap, before BLE) ---- */
+	{
+		uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+		ESP_LOGI(TAG, "Before WiFi: largest free block=%lu bytes%s",
+			 largest,
+			 largest < 30000 ? " ⚠️ may fail!" : "");
+	}
+	ESP_LOGI(TAG, "WiFi STA-only: trying saved network...");
+	if (wifi_cfg_start_sta_only() == ESP_OK && wifi_cfg_is_sta_connected()) {
+		ESP_LOGI(TAG, "STA connected — syncing data");
+		upload_send_all(g_ct511n);
+	} else {
+		ESP_LOGI(TAG, "STA not available at boot");
+	}
+	wifi_cfg_deinit(); /* fully release WiFi driver memory before BLE */
+	LOG_MEM_AFTER(TAG, "wifi_cfg_deinit (boot)");
+
+	/* ---- Phase 2: BLE init (heap clean after WiFi deinit) ---- */
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+	esp_err_t ble_err = ble_img_init(epd_ble_img_ready);
+	if (ble_err != ESP_OK) {
+		ESP_LOGW(TAG, "BLE init: %s", esp_err_to_name(ble_err));
+	} else {
+		ESP_LOGI(TAG, "BLE advertising as \"4G-Tracker\"");
+	}
+#endif
 
 	/* ================================================================== */
 	/*  Main State Machine                                                */
 	/* ================================================================== */
 	while (1) {
 
+		/* 检查 EPD 更新标志（由 BLE 回调在蓝牙任务中设置） */
+		if (g_need_epd_update) {
+			g_need_epd_update = false;
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+			/* 暂停 BLE 广播，释放 RF 资源供 EPD SPI 独占使用 */
+			ble_img_pause();
+#endif
+			ESP_LOGI(TAG, "EPD update from main task (BLE paused)...");
+			epd_update_full_from_flash(IMG_CACHE_BASE_ADDR);
+			ESP_LOGI(TAG, "EPD update done");
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+			vTaskDelay(pdMS_TO_TICKS(100)); /* 让系统呼吸，释放碎片 */
+			ble_img_resume();
+#endif
+		}
+
 		switch (g_state) {
 
 		case STATE_ACTIVE:
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+			/* ⭐ 蓝牙图片传输中——立即切出 ACTIVE 状态，屏蔽 4G/WiFi 干扰 */
+			if (ble_img_is_busy()) {
+				g_state = STATE_IMG_RECEIVE;
+				break;
+			}
+#endif
 			/* Motion resets inactivity timer */
 			if (g_motion_flag) {
 				g_motion_flag = false;
 				g_last_motion_us = esp_timer_get_time();
 			}
 
-			/* BMI160 double-tap  -- IMG_RECEIVE */
+			/*
+			 * BMI160 double-tap:
+			 *   Pause BLE → AP config mode (60s) → Resume BLE
+			 *   20s for station connect; if connected, keep until config saved.
+			 */
 			if (g_img_trigger_flag) {
 				g_img_trigger_flag = false;
-				g_state = STATE_IMG_RECEIVE;
+				ESP_LOGI(TAG, "double-tap — AP config mode 60s");
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+				ble_img_pause();  /* fully deinit BLE host+controller → frees ~50KB */
+#endif
+				vTaskDelay(pdMS_TO_TICKS(200));
+				ESP_LOGI(TAG, "Free internal heap before WiFi: %d bytes",
+					 heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+				if (wifi_cfg_start_ap_only(NULL) == ESP_OK) {
+					int64_t ap_start = esp_timer_get_time();
+					bool sta_conn = false;
+					while (esp_timer_get_time() - ap_start < CFG_AP_TOTAL_TIMEOUT_US) {
+						int64_t elapsed = esp_timer_get_time() - ap_start;
+						if (!sta_conn && elapsed > CFG_AP_NO_STA_TIMEOUT_US) {
+							ESP_LOGI(TAG, "AP: no station in 20s");
+							break;
+						}
+						if (!sta_conn && wifi_cfg_is_ap_sta_connected()) {
+							sta_conn = true;
+							ESP_LOGI(TAG, "AP: station connected");
+						}
+						if (wifi_cfg_is_done()) {
+							ESP_LOGI(TAG, "AP: config saved");
+							break;
+						}
+						vTaskDelay(pdMS_TO_TICKS(100));
+					}
+				}
+				wifi_cfg_deinit(); /* fully release WiFi memory before BLE resume */
+				LOG_MEM_AFTER(TAG, "wifi_cfg_deinit (AP config)");
+				ESP_LOGI(TAG, "AP closed — returning to BLE");
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+				ble_img_resume();
+#endif
 				break;
+			}
+
+			/* Periodic STA scan — 时分复用: 全停 BLE → WiFi → 重启 BLE */
+			{
+				static int64_t next_wifi_us = 0;
+				static bool prev_ok = false;
+				int64_t nw = esp_timer_get_time();
+				if (next_wifi_us == 0)
+					next_wifi_us = nw + CFG_PERIODIC_SCAN_INTERVAL_US;
+				if (nw >= next_wifi_us) {
+					next_wifi_us = nw + (prev_ok ? CFG_WIFI_UPLOAD_INTERVAL_US
+							      : CFG_PERIODIC_SCAN_INTERVAL_US);
+					ESP_LOGI(TAG, "WiFi: pausing BLE...");
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+					ble_img_pause();
+#endif
+					vTaskDelay(pdMS_TO_TICKS(200));
+					ESP_LOGI(TAG, "Free internal heap before WiFi: %d bytes",
+						 heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+					bool ok = (wifi_cfg_start_sta_only() == ESP_OK);
+					if (ok) {
+						ESP_LOGI(TAG, "WiFi: connected, uploading...");
+						upload_send_all(g_ct511n);
+					}
+					wifi_cfg_deinit();
+					LOG_MEM_AFTER(TAG, "wifi_cfg_deinit (periodic scan)");
+					ESP_LOGI(TAG, "WiFi: done (ok=%d), resuming BLE", ok);
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+					ble_img_resume();
+#endif
+					prev_ok = ok;
+				}
 			}
 
 			/* Inactivity timeout  -- LOW_POWER */
 			if ((esp_timer_get_time() - g_last_motion_us) >
 			    (CFG_INACTIVITY_TIMEOUT_MS * 1000LL)) {
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+				/* Don't sleep while BLE image transfer is active */
+				if (ble_img_is_busy()) {
+					g_last_motion_us = esp_timer_get_time();
+					break;
+				}
+#endif
 				low_power_enter(g_timer, g_ct511n,
 						g_w25q64, g_hub);
 				g_state = STATE_LOW_POWER;
@@ -292,8 +426,11 @@ void app_main(void)
 
 		/* ---- Phase: DEEP_WAIT  -- automatic light sleep via PM ---- */
 		if (lp_phase == LP_DEEP_WAIT) {
-			/* Block on semaphore.  PM + tickless-idle automatically
-			 * puts the CPU into hardware light sleep while waiting. */
+			/* Re-enable GPIO wakeup before every sleep cycle —
+			 * esp_sleep_enable_gpio_wakeup() is consumed by each
+			 * light-sleep and the PM framework in v6.0 does NOT
+			 * automatically re-call it. */
+			esp_sleep_enable_gpio_wakeup();
 			if (xSemaphoreTake(g_motion_sem, pdMS_TO_TICKS(1000)) == pdTRUE) {
 				ESP_LOGI(TAG, "motion #1 (GPIO wakeup)  -- MODEM_WAIT");
 				lp_phase = LP_MODEM_WAIT;
@@ -350,53 +487,108 @@ void app_main(void)
 	break;
 
 		case STATE_IMG_RECEIVE: {
-			static bool img_init_done = false;
-			if (!img_init_done) {
-				esp_err_t err = img_recv_enter(CFG_SPI_HOST,
-							       g_w25q64);
-				if (err != ESP_OK) {
-					ESP_LOGE(TAG, "img_recv_enter: %s",
-						 esp_err_to_name(err));
-					g_state = STATE_ACTIVE;
-					break;
-				}
-				img_init_done = true;
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+			static bool xfer_active = false;
+			static int64_t last_data_time_us = 0;
+			static uint32_t prev_bytes = 0;
+
+			if (!xfer_active) {
+				storage_set_ram_mode(true);
+				xfer_active = true;
+				prev_bytes = 0;
+				last_data_time_us = esp_timer_get_time();
+				ESP_LOGI(TAG, "IMG_RECEIVE started — waiting for BLE image...");
 			}
 
-			/* Sample at 1 s intervals (driven by gptimer) */
+			/* 图片传输期间跳过采样，防止 SPI 竞争 */
 			if (g_sample_flag) {
 				g_sample_flag = false;
-				if (!img_recv_poll(g_hub, g_ct511n,
-						   g_sample_count++)) {
-					img_recv_exit();
-					img_init_done = false;
-					g_state = STATE_ACTIVE;
-					break;
-				}
+				ESP_LOGW(TAG, "Sampling skipped to protect ongoing BLE transfer");
 			}
 
-			/* Check if BLE transfer finished (non-sampling poll) */
-			if (!ble_img_is_busy() && img_init_done) {
-				img_recv_exit();
-				img_init_done = false;
+			/* 🛑 动态进度监控：获取当前实际收到的字节数 */
+			uint32_t cur_bytes = ble_img_bytes_received();
+			if (cur_bytes != prev_bytes) {
+				prev_bytes = cur_bytes;
+				last_data_time_us = esp_timer_get_time(); // 只要收到新数据，刷新时间
+			}
+
+			/* 🛑【阶梯超时机制 - 核心修复】
+			 * 如果 cur_bytes == 0 (代表手机还在准备中)，给 35 秒宽容期
+			 * 如果 cur_bytes > 0  (代表已经开始传输)，给 6 秒断流超时 */
+			int64_t timeout_threshold_us = (cur_bytes == 0) ? 35000000LL : 6000000LL;
+			int64_t now_us = esp_timer_get_time();
+
+			if (xfer_active && (now_us - last_data_time_us > timeout_threshold_us)) {
+				ESP_LOGE(TAG, "BLE transfer TIMEOUT (Received: %d bytes) — forcing exit", cur_bytes);
+				storage_set_ram_mode(false);
+				ram_cache_flush();
+				xfer_active = false;
 				g_state = STATE_ACTIVE;
 				break;
 			}
 
+			/* 正常传输完成 */
+			if (!ble_img_is_busy() && xfer_active) {
+				ESP_LOGI(TAG, "BLE transfer finished successfully! Total: %d bytes", cur_bytes);
+				storage_set_ram_mode(false);
+				ram_cache_flush();
+				xfer_active = false;
+				g_state = STATE_ACTIVE;
+				break;
+			}
 			vTaskDelay(pdMS_TO_TICKS(50));
+#else
+			ESP_LOGW(TAG, "IMG_RECEIVE skipped — BLE not enabled");
+			g_state = STATE_ACTIVE;
+#endif
 			break;
 		}
 
-		case STATE_SAMPLE:
-			vTaskDelay(pdMS_TO_TICKS(CFG_CT_WAKE_DELAY_MS));
+		case STATE_SAMPLE: {
+			/* 1. 进门立刻拦截 */
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+			if (ble_img_is_busy()) {
+				ESP_LOGW(TAG, "BLE busy BEFORE sample delay — intercept, goto IMG_RECEIVE");
+				g_state = STATE_IMG_RECEIVE;
+				break;
+			}
+#endif
 
+			/* 2. 将原本整块的 Delay 拆碎，防止在 Delay 期间无法拦截蓝牙 */
+			int delay_ms = CFG_CT_WAKE_DELAY_MS;
+			bool ble_interrupted = false;
+			while (delay_ms > 0) {
+				vTaskDelay(pdMS_TO_TICKS(20));
+				delay_ms -= 20;
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+				if (ble_img_is_busy()) {
+					ESP_LOGW(TAG, "BLE busy DURING sample delay — intercept, goto IMG_RECEIVE");
+					g_state = STATE_IMG_RECEIVE;
+					ble_interrupted = true;
+					break;
+				}
+#endif
+			}
+			if (ble_interrupted) break; // 如果在延时期间蓝牙忙了，直接退出
+
+			/* 3. 只有蓝牙不忙才执行耗时采样 */
 			sample_sensors(g_hub, g_ct511n, g_sample_count++);
 
-			/* Upload all pending records (connect retry inside) */
-			upload_send_all(g_ct511n);
+			/* 4. 采样完、上报前，进行最后一道钢铁防线拦截 */
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+			if (ble_img_is_busy()) {
+				ESP_LOGW(TAG, "BLE busy AFTER sample — DEFERRING 4G upload, goto IMG_RECEIVE");
+				g_state = STATE_IMG_RECEIVE;
+				break; // 🛑 坚决不调用 upload_send_all，防止 4G 拨号卡死蓝牙！
+			}
+#endif
 
+			/* 5. 此时确保蓝牙绝对安全、空闲，才允许执行可能阻塞的 4G 上传 */
+			upload_send_all(g_ct511n);
 			g_state = STATE_ACTIVE;
 			break;
+		}
 
 		case STATE_INIT:
 		default:

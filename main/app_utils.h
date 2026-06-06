@@ -1,26 +1,26 @@
 ﻿#pragma once
 
-
-
 #include <stdbool.h>
-
 #include <stdint.h>
 
-
-
 #include "driver/gptimer.h"
-
 #include "driver/spi_master.h"
-
 #include "esp_err.h"
-
-
+#include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "CT511N.h"
-
 #include "W25Q64.h"
-
 #include "sensor_hub.h"
+
+/* 内存诊断宏：在模块 deinit 后调用，显示释放后的空闲内存 */
+#define LOG_MEM_AFTER(tag, module)  do {                                     \
+	ESP_LOGW(tag, "MEM after %s: Free=%lu  MaxBlock=%lu  DMA_MaxBlock=%lu", \
+		 module,                                                         \
+		 (unsigned long)esp_get_free_heap_size(),                          \
+		 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), \
+		 (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA)); \
+} while (0)
 
 
 
@@ -118,75 +118,24 @@ void upload_send_all(ct511n_handle_t *ct511n);
 
 /* ========================================================================= */
 
-/*  IMG_RECEIVE helpers  -- display + BLE image receive                       */
+/*  EPD helpers                                                              */
 
 /* ========================================================================= */
 
 
 
-/**
+/** Initialise EPD display on shared SPI bus. */
 
- * @brief  Initialise the display (ST7789) and start BLE advertising.
-
- *
-
- * Called once when entering STATE_IMG_RECEIVE.  Registers an internal
-
- * callback that displays the received image automatically.
-
- *
-
- * @param  host          SPI host used (shared with W25Q64)
-
- * @param  flash_handle  W25Q64 handle (for image cache writes)
-
- * @return ESP_OK on success.
-
- */
-
-esp_err_t img_recv_enter(spi_host_device_t host,
-
-			 w25q64_handle_t *flash_handle);
+esp_err_t epd_app_init(spi_host_device_t host, void *flash_handle);
 
 
 
-/**
+/** BLE-image-received callback for EPD display. */
 
- * @brief  Exit IMG_RECEIVE: stop BLE, flush RAM cache, turn off display.
+int epd_ble_img_ready(uint32_t total_bytes);
 
- */
-
-void img_recv_exit(void);
-
-
-
-/**
-
- * @brief  Perform one iteration of the IMG_RECEIVE polling loop.
-
- *
-
- * Must be called periodically from the main loop while in IMG_RECEIVE state.
-
- * Keeps the watchdog fed and checks BLE state.  Returns false when the
-
- * caller should transition back to STATE_ACTIVE.
-
- *
-
- * @param  hub     sensor hub (for sampling during image reception)
-
- * @param  ct511n  CT511N handle (for GPS during image reception)
-
- * @param  count   current sample count
-
- * @return true if still receiving; false if image transfer is complete
-
- */
-
-bool img_recv_poll(sensor_hub_t *hub, ct511n_handle_t *ct511n,
-
-		   uint32_t count);
+/** Set by epd_ble_img_ready() in BLE task, consumed by main loop. */
+extern volatile bool g_need_epd_update;
 
 
 
@@ -212,7 +161,7 @@ bool img_recv_poll(sensor_hub_t *hub, ct511n_handle_t *ct511n,
 
 bool sample_sensors(sensor_hub_t *hub, ct511n_handle_t *ct511n,
 
-		    uint32_t count);
+    uint32_t count);
 
 
 
@@ -221,4 +170,3 @@ bool sample_sensors(sensor_hub_t *hub, ct511n_handle_t *ct511n,
 }
 
 #endif
-

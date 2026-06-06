@@ -172,6 +172,7 @@ esp_err_t ct511n_reset(ct511n_handle_t *handle);
 esp_err_t ct511n_gps_on(ct511n_handle_t *handle);
 esp_err_t ct511n_gps_off(ct511n_handle_t *handle);
 esp_err_t ct511n_gps_get(ct511n_handle_t *handle, char *gps_buf, size_t gps_buf_size);
+esp_err_t ct511n_gps_get_time(ct511n_handle_t *handle, char *time_buf, size_t time_buf_size);
 esp_err_t ct511n_agnss_get(ct511n_handle_t *handle);
 esp_err_t ct511n_agnss_set(ct511n_handle_t *handle);
 esp_err_t ct511n_gps_init(ct511n_handle_t *handle);

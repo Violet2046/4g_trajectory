@@ -1,15 +1,20 @@
 ﻿#include "app_utils.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "storage_mgr.h"
 #include "wifi_cfg.h"
-#include "ST7789.h"
+#ifdef CONFIG_BT_NIMBLE_ENABLED
 #include "ble_img_rx.h"
+#endif
+#include "epd_qyeg0397.h"
 
 #define TAG "main"
 
@@ -53,6 +58,10 @@ void low_power_enter(gptimer_handle_t timer,
 		ESP_LOGW(TAG, "sensor_hub_sleep failed: %s  -- wakeup may not work",
 			 esp_err_to_name(err));
 	}
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+	ble_adv_stop();
+	vTaskDelay(pdMS_TO_TICKS(150));   /* wait for NimBLE host to process stop */
+#endif
 	ESP_LOGI(TAG, "waiting for any-motion...");
 }
 
@@ -66,7 +75,16 @@ void low_power_exit(gptimer_handle_t timer,
 	vTaskDelay(pdMS_TO_TICKS(1));
 	vTaskDelay(pdMS_TO_TICKS(500));
 	sensor_hub_wake(hub);
-	timer_start(timer, 1);
+	timer_start(timer, CFG_SAMPLE_INTERVAL_S);
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+	/* Retry adv_start from main-task context (safe to vTaskDelay — won't
+	 * block the NimBLE host task).  The sync callback's first attempt
+	 * may fail if the GAP module hasn't finished init yet. */
+	for (int i = 0; i < 5; i++) {
+		if (ble_adv_start() == ESP_OK) break;
+		vTaskDelay(pdMS_TO_TICKS(50));
+	}
+#endif
 	ESP_LOGI(TAG, "all modules restored to ACTIVE");
 }
 
@@ -80,6 +98,7 @@ void low_power_sleep_configure(void)
 	 * esp_sleep_enable_gpio_wakeup() is consumed each sleep and
 	 * must be re-called before every esp_light_sleep_start(). */
 	gpio_wakeup_enable(CFG_BMI160_INT1_PIN, GPIO_INTR_HIGH_LEVEL);
+	esp_sleep_enable_gpio_wakeup();
 	ESP_LOGI(TAG, "light-sleep wakeup configured on GPIO %d (HIGH_LEVEL)",
 		 (int)CFG_BMI160_INT1_PIN);
 }
@@ -95,6 +114,79 @@ void low_power_sleep_unconfigure(void)
 /* Fallback RAM buffer for last sample (used when no flash) */
 static storage_record_t g_last_rec;
 static bool g_rec_valid = false;
+
+/* ---- EPD overlay scratch buffer (small, fits in DRAM) ---- */
+#define OVERLAY_BUF_SIZE    ((OVERLAY_W * OVERLAY_H) / 4UL)  /* ~10 KB */
+static uint8_t g_overlay_buf[OVERLAY_BUF_SIZE];
+static bool g_overlay_inited = false;
+
+/* ---- EPD is initialised? ---- */
+static bool g_epd_ready = false;
+
+/* ---- EPD update flag — set by BLE callback, consumed by main loop ---- */
+volatile bool g_need_epd_update = false;
+
+/* ---- EPD initialisation (call once after hardware_init) ---- */
+
+esp_err_t epd_app_init(spi_host_device_t host, void *flash_handle)
+{
+
+    epd_config_t cfg = {
+        .spi_host     = host,
+        .clk_speed_hz = CFG_EPD_SPI_FREQ_HZ,
+        .pin_cs       = CFG_EPD_CS_GPIO,
+        .pin_dc       = CFG_EPD_DC_GPIO,
+        .pin_rst      = CFG_EPD_RST_GPIO,
+        .pin_busy     = CFG_EPD_BUSY_GPIO,
+        .pin_mosi     = CFG_SPI_MOSI_GPIO,
+        .pin_sclk     = CFG_SPI_SCK_GPIO,
+    };
+
+    esp_err_t err = epd_init_shared_bus(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "EPD init: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    epd_set_flash_handle(flash_handle);
+    g_epd_ready = true;
+    ESP_LOGI(TAG, "EPD ready");
+    return ESP_OK;
+}
+
+/** Update EPD sensor overlay with latest sample data. */
+static void epd_overlay_update(const sensor_sample_t *s)
+{
+    if (!g_epd_ready || !s) return;
+
+    epd_sensor_data_t d = {
+        .acc_x = s->acc.x, .acc_y = s->acc.y, .acc_z = s->acc.z,
+        .gyr_x = s->gyr.x, .gyr_y = s->gyr.y, .gyr_z = s->gyr.z,
+        .mag_x = s->mag.x, .mag_y = s->mag.y, .mag_z = s->mag.z,
+        .gps_fix = s->gps_fix, .lat = s->lat, .lon = s->lon,
+    };
+    epd_sensor_overlay_window(g_overlay_buf, &d);
+}
+
+/* ---- BLE image → EPD display callback (runs in BLE host task) ---- */
+#ifdef CONFIG_BT_NIMBLE_ENABLED
+int epd_ble_img_ready(uint32_t total_bytes)
+{
+    if (!g_epd_ready) return -1;
+    ESP_LOGI(TAG, "BLE image received (%lu B) — signaling main task",
+             (unsigned long)(total_bytes > 0 ? total_bytes : EPD_DATA_SIZE));
+    /* 仅设置标志位，由 main 任务在安全上下文中执行刷屏 */
+    g_need_epd_update = true;
+    return 0;
+}
+#else
+int epd_ble_img_ready(uint32_t total_bytes)
+{
+    (void)total_bytes;
+    ESP_LOGW(TAG, "BLE not configured — cannot display image");
+    return -1;
+}
+#endif
 /** Build payload string from a storage_record_t. Returns payload length. */
 static int build_payload(char *buf, size_t bufsz, const storage_record_t *r)
 {
@@ -118,6 +210,13 @@ void upload_send_all(ct511n_handle_t *ct511n)
 	esp_err_t err;
 	/* ---- Prefer WiFi if STA is connected ---- */
 	if (wifi_cfg_is_sta_connected()) {
+		/* Rate-limit WiFi uploads: only every CFG_WIFI_UPLOAD_INTERVAL_US */
+		static int64_t last_wifi_up_us = 0;
+		int64_t now = esp_timer_get_time();
+		if (now - last_wifi_up_us < CFG_WIFI_UPLOAD_INTERVAL_US) {
+			return;  /* too soon — data stays in flash for next batch */
+		}
+		last_wifi_up_us = now;
 		/* Close 4G data network + DTR sleep to save power */
 		ct511n_4g_net_close(ct511n);
 		vTaskDelay(pdMS_TO_TICKS(100));
@@ -146,160 +245,184 @@ void upload_send_all(ct511n_handle_t *ct511n)
 			 (unsigned long)sent, (unsigned long)failed);
 		return;
 	}
-	/* ---- Fallback: 4G via CT511N (use flash config, may be updated by WiFi cfg) ---- */
-	storage_config_t cfg;
-	storage_config_default(&cfg);
-	esp_err_t read_err = storage_config_read(&cfg);
-	if (read_err != ESP_OK) {
-		ESP_LOGW(TAG, "storage_config_read failed (%s) — using defaults",
-			 esp_err_to_name(read_err));
-	}
-	ESP_LOGI(TAG, "4G TCP target: %s:%s", cfg.server_ip, cfg.server_port);
-	err = ct511n_tcp_single_connect(ct511n, cfg.server_ip, cfg.server_port);
-	if (err != ESP_OK) {
-		ESP_LOGW(TAG, "TCP connect failed  -- upload skipped");
-		return;
-	}
-	for (;;) {
-		storage_record_t rec;
-		bool found = false;
-		if (storage_record_peek(&rec, &found) != ESP_OK || !found) break;
-		build_payload(payload, sizeof(payload), &rec);
-		err = ct511n_4g_tcp_send(ct511n, payload);
-		if (err == ESP_OK) {
-			storage_record_mark_uploaded();
-			sent++;
+	/* ---- Fallback: 4G via CT511N (use cached config, avoid SPI read) ---- */
+	static bool s_server_connected = false;
+	static bool s_first_connect_done = false;
+	static storage_config_t s_cached_cfg;
+	static bool s_cached_cfg_valid = false;
+
+	if (!s_cached_cfg_valid) {
+		storage_config_default(&s_cached_cfg);
+		if (storage_config_read(&s_cached_cfg) == ESP_OK) {
+			s_cached_cfg_valid = true;
 		} else {
-			ESP_LOGW(TAG, "send failed  -- reconnecting...");
-			vTaskDelay(pdMS_TO_TICKS(200));
-			err = ct511n_tcp_single_connect(ct511n, cfg.server_ip, cfg.server_port);
+			ESP_LOGW(TAG, "storage_config_read failed — using defaults");
+		}
+	}
+	ESP_LOGI(TAG, "4G TCP target: %s:%s", s_cached_cfg.server_ip, s_cached_cfg.server_port);
+
+	/* ---- Connect phase: only when not already connected ---- */
+	if (!s_server_connected) {
+		int max_retries = s_first_connect_done ? 1 : 5;
+		ESP_LOGI(TAG, "TCP connecting (max %d attempts)...", max_retries);
+		for (int retry = 0; retry < max_retries; retry++) {
+			err = ct511n_tcp_single_connect(ct511n, s_cached_cfg.server_ip,
+							s_cached_cfg.server_port);
 			if (err == ESP_OK) {
-				err = ct511n_4g_tcp_send(ct511n, payload);
+				s_server_connected = true;
+				ESP_LOGI(TAG, "TCP connected (attempt %d/%d)",
+					 retry + 1, max_retries);
+				break;
 			}
+			ESP_LOGW(TAG, "TCP attempt %d/%d failed", retry + 1, max_retries);
+		}
+		s_first_connect_done = true;
+	}
+
+	/* ---- Send phase: only if connected ---- */
+	if (s_server_connected) {
+		for (;;) {
+			storage_record_t rec;
+			bool found = false;
+			if (storage_record_peek(&rec, &found) != ESP_OK || !found) break;
+			build_payload(payload, sizeof(payload), &rec);
+			err = ct511n_4g_tcp_send(ct511n, payload);
 			if (err == ESP_OK) {
 				storage_record_mark_uploaded();
 				sent++;
 			} else {
+				ESP_LOGW(TAG, "send failed — server disconnected");
+				s_server_connected = false;
 				storage_record_set_last_status(STORAGE_REC_STATUS_FAILED);
 				failed++;
+				break;  /* stop sending; data stays in flash for next time */
+			}
+			vTaskDelay(pdMS_TO_TICKS(50));
+		}
+		/* RAM fallback (only used when flash is unavailable) */
+		if (s_server_connected && g_rec_valid) {
+			build_payload(payload, sizeof(payload), &g_last_rec);
+			if (ct511n_4g_tcp_send(ct511n, payload) == ESP_OK) {
+				sent++; g_rec_valid = false;
+			} else {
+				s_server_connected = false;
 			}
 		}
-		vTaskDelay(pdMS_TO_TICKS(50));
+	} else {
+		ESP_LOGW(TAG, "TCP not connected — upload skipped (records stay in flash)");
 	}
-	if (sent == 0 && failed == 0 && g_rec_valid) {
-		build_payload(payload, sizeof(payload), &g_last_rec);
-		if (ct511n_4g_tcp_send(ct511n, payload) == ESP_OK) {
-			sent = 1; g_rec_valid = false;
+
+	ESP_LOGI(TAG, "upload done (4G)  -- %lu sent, %lu failed  connected=%d",
+		 (unsigned long)sent, (unsigned long)failed, s_server_connected);
+}
+
+/* ========================================================================= */
+/*  Unix timestamp: GPS → WiFi SNTP → 4G CCLK → uptime                      */
+/* ========================================================================= */
+static uint32_t get_unix_timestamp(ct511n_handle_t *ct511n)
+{
+	struct tm tm = {0};
+	time_t t;
+
+	/* 1. Try GPS time (GPSST: DDMMYY HHMMSS) */
+	if (ct511n) {
+		char time_buf[32];
+		if (ct511n_gps_get_time(ct511n, time_buf, sizeof(time_buf)) == ESP_OK
+		    && time_buf[0]) {
+			memset(&tm, 0, sizeof(tm));
+			if (sscanf(time_buf, "%2d%2d%2d %2d%2d%2d",
+				   &tm.tm_mday, &tm.tm_mon, &tm.tm_year,
+				   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6
+			    && tm.tm_mday >= 1 && tm.tm_mday <= 31
+			    && tm.tm_mon  >= 1 && tm.tm_mon  <= 12
+			    && tm.tm_year >= 0 && tm.tm_year <= 99) {
+				tm.tm_year += 100;
+				tm.tm_mon  -= 1;
+				t = mktime(&tm);
+				if (t > 1000000000) {
+					ESP_LOGD(TAG, "time source: GPS");
+					return (uint32_t)t;
+				}
+			}
 		}
 	}
-	ESP_LOGI(TAG, "upload done (4G)  -- %lu sent, %lu failed",
-		 (unsigned long)sent, (unsigned long)failed);
+
+	/* 2. Try WiFi SNTP */
+	t = time(NULL);
+	if (t > 1700000000) {
+		ESP_LOGD(TAG, "time source: SNTP");
+		return (uint32_t)t;
+	}
+
+	/* 3. Try 4G CCLK (format: cclk=YY/MM/DD,HH:MM:SS+TZ) */
+	if (ct511n) {
+		char clk_buf[64];
+		if (ct511n_4g_clk_get(ct511n, clk_buf, sizeof(clk_buf)) == ESP_OK
+		    && clk_buf[0]) {
+			memset(&tm, 0, sizeof(tm));
+			if (sscanf(clk_buf, "cclk=%2d/%2d/%2d%*c%2d:%2d:%2d",
+				   &tm.tm_year, &tm.tm_mon, &tm.tm_mday,
+				   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) == 6
+			    && tm.tm_year >= 20 && tm.tm_year <= 99
+			    && tm.tm_mon  >= 1  && tm.tm_mon  <= 12
+			    && tm.tm_mday >= 1  && tm.tm_mday <= 31) {
+				tm.tm_year += 100;
+				tm.tm_mon  -= 1;
+				t = mktime(&tm);
+				if (t > 1000000000) {
+					ESP_LOGD(TAG, "time source: 4G CCLK");
+					return (uint32_t)t;
+				}
+			}
+		}
+	}
+
+	/* 4. Fallback: uptime */
+	uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+	ESP_LOGD(TAG, "time source: uptime (%lu)", (unsigned long)uptime);
+	return uptime;
 }
 
 /* ========================================================================= */
-/*  IMG_RECEIVE helpers                                                      */
+/*  Sensor power-save helpers (post-sample)                                  */
 /* ========================================================================= */
-/** Handle to the ST7789 display (NULL until img_recv_enter). */
-static st7789_handle_t *g_display = NULL;
-/** W25Q64 handle passed via img_recv_enter, used by BLE callback. */
-static w25q64_handle_t *g_img_flash = NULL;
-/** Callback invoked by BLE component when image transfer is complete. */
-static int img_recv_on_ready(uint32_t total_bytes)
+
+/** Power down non-essential sensors after a sample:
+ *  - AK09911C → POWERDOWN
+ *  - BMI160 gyro → SUSPEND
+ *  (BMI160 accelerometer stays on for any-motion wakeup) */
+static void sensors_power_save(sensor_hub_t *hub)
 {
-	if (g_display == NULL) return -1;
-	ESP_LOGI(TAG, "image received (%lu B) -- displaying...", total_bytes);
-	if (total_bytes == 0) {
-		/* Re-display the last image already in Flash */
-		total_bytes = ST7789_LCD_WIDTH * ST7789_LCD_HEIGHT * 2;
-	}
-	/* Display the image from Flash onto the screen */
-	esp_err_t err = st7789_display_from_flash(g_display, 0,
-						  ST7789_LCD_WIDTH,
-						  ST7789_LCD_HEIGHT);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "display_from_flash: %s", esp_err_to_name(err));
-		return -1;
-	}
-	ESP_LOGI(TAG, "image displayed");
-	return 0;
+    if (!hub) return;
+    bmi160_handle_t *bmi = sensor_hub_get_bmi160(hub);
+    ak09911_handle_t *mag = sensor_hub_get_ak09911(hub);
+    if (bmi) bmi160_gyr_set_mode(bmi, BMI160_MODE_SUSPEND);
+    if (mag) ak09911_mode_set(mag, AK09911_MODE_POWERDOWN);
 }
 
-esp_err_t img_recv_enter(spi_host_device_t host,
-			 w25q64_handle_t *flash_handle)
+/** Restore sensors before a sample (reverse of sensors_power_save). */
+static void sensors_power_restore(sensor_hub_t *hub)
 {
-	esp_err_t err;
-	/* Store the flash handle for BLE callback */
-	g_img_flash = flash_handle;
-	/* ---- Initialise ST7789 display (SPI bus already init'd by W25Q64) ---- */
-	st7789_config_t disp_cfg = {
-		.host     = host,
-		.cs_gpio  = CFG_ST7789_CS_GPIO,
-		.dc_gpio  = CFG_ST7789_DC_GPIO,
-		.rst_gpio = CFG_ST7789_RST_GPIO,
-		.blk_gpio = CFG_ST7789_BLK_GPIO,
-		.freq_hz  = CFG_ST7789_SPI_FREQ_HZ,
-	};
-	err = st7789_init(&g_display, &disp_cfg);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "st7789_init: %s", esp_err_to_name(err));
-		return err;
-	}
-	/* Clear screen to black */
-	st7789_fill_screen(g_display, 0x0000);
-	/* ---- Start BLE advertising ---- */
-	err = ble_img_init(img_recv_on_ready);
-	if (err != ESP_OK) {
-		ESP_LOGE(TAG, "ble_img_init: %s", esp_err_to_name(err));
-		st7789_destroy(g_display);
-		g_display = NULL;
-		return err;
-	}
-	/* ---- Redirect sensor records to RAM (avoid SPI conflict) ---- */
-	storage_set_ram_mode(true);
-	ESP_LOGI(TAG, "IMG_RECEIVE started  -- BLE advertising");
-	return ESP_OK;
-}
-
-void img_recv_exit(void)
-{
-	ESP_LOGI(TAG, "exiting IMG_RECEIVE");
-	/* Stop BLE */
-	ble_img_deinit();
-	/* Flush RAM-cached samples to Flash, restore normal mode */
-	storage_set_ram_mode(false);
-	esp_err_t flush_err = ram_cache_flush();
-	if (flush_err != ESP_OK) {
-		ESP_LOGW(TAG, "ram_cache_flush: %s", esp_err_to_name(flush_err));
-	}
-	/* Turn off display */
-	if (g_display != NULL) {
-		st7789_display_on(g_display, false);
-		st7789_destroy(g_display);
-		g_display = NULL;
-	}
-	g_img_flash = NULL;
-	ESP_LOGI(TAG, "IMG_RECEIVE done");
-}
-
-bool img_recv_poll(sensor_hub_t *hub, ct511n_handle_t *ct511n,
-		   uint32_t count)
-{
-	/* Sample sensors into RAM cache (called at 1s intervals) */
-	extern bool sample_sensors(sensor_hub_t *, ct511n_handle_t *,
-				   uint32_t);
-	sample_sensors(hub, ct511n, count);
-	/* Return false when BLE transfer is done */
-	return ble_img_is_busy();
+    if (!hub) return;
+    bmi160_handle_t *bmi = sensor_hub_get_bmi160(hub);
+    ak09911_handle_t *mag = sensor_hub_get_ak09911(hub);
+    if (bmi) bmi160_gyr_set_mode(bmi, BMI160_MODE_NORMAL);
+    if (mag) ak09911_mode_set(mag, AK09911_MODE_CONT_1);
 }
 
 /* ========================================================================= */
-/*  Sample + upload (combined  -- store then flush pending)                    */
+/*  Sample + upload                                                          */
 /* ========================================================================= */
 bool sample_sensors(sensor_hub_t *hub, ct511n_handle_t *ct511n,
 		    uint32_t count)
 {
 	sensor_sample_t s;
+
+	/* Restore sensors that were powered down last sample */
+	sensors_power_restore(hub);
+
 	sensor_hub_sample(hub, &s);
+	s.timestamp = get_unix_timestamp(ct511n);
 	/* GPS */
 	char gps_buf[256] = {0};
 	esp_err_t gps_err = ct511n_gps_get(ct511n, gps_buf, sizeof(gps_buf));
@@ -340,5 +463,12 @@ bool sample_sensors(sensor_hub_t *hub, ct511n_handle_t *ct511n,
 	} else if (store_err != ESP_OK) {
 		ESP_LOGW(TAG, "store: %s", esp_err_to_name(store_err));
 	}
+
+	/* Update EPD sensor overlay */
+	epd_overlay_update(&s);
+
+	/* Power down non-essential sensors between samples */
+	sensors_power_save(hub);
+
 	return s.gps_fix;
 }

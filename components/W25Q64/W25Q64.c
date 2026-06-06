@@ -7,10 +7,20 @@
 #include "freertos/task.h"
 
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
 
 #include "W25Q64.h"
+
+/*
+ * 全局静态 DMA 缓冲区，系统启动时预占连续 DMA 内存，永不释放。
+ * SPI 传输不超过 512 字节时使用此缓冲区，彻底绕过堆碎片导致的
+ * setup_dma_priv_buffer 失败。用独立互斥锁保护，支持多任务并发。
+ */
+#define DMA_BUF_SIZE  512
+static uint8_t s_spi_dma_buf[DMA_BUF_SIZE] __attribute__((aligned(4)));
+static SemaphoreHandle_t s_spi_dma_lock = NULL;
 
 #define W25Q64_TAG "W25Q64"
 
@@ -43,15 +53,27 @@ static esp_err_t w25q64_spi_txrx(w25q64_handle_t *handle,
 				 const uint8_t *tx, size_t tx_len,
 				 uint8_t *rx, size_t rx_len)
 {
-	/* Full-duplex: total transaction = tx_len (cmd/addr) + rx_len (data).
-	 * The RX buffer captures everything; real data starts at offset tx_len. */
+	/* Full-duplex: total transaction = tx_len (cmd/addr) + rx_len (data). */
 	size_t total = tx_len + rx_len;
-	uint8_t *tx_buf = (uint8_t *)malloc(total);
-	uint8_t *rx_buf = (uint8_t *)malloc(total);
-	if ((tx_buf == NULL) || (rx_buf == NULL)) {
-		free(tx_buf);
-		free(rx_buf);
-		return ESP_ERR_NO_MEM;
+
+	uint8_t *tx_buf, *rx_buf;
+	bool use_static = (total <= DMA_BUF_SIZE);
+
+	if (use_static) {
+		/* 小传输用预分配的静态 DMA 缓冲区，绝不失败 */
+		if (s_spi_dma_lock) xSemaphoreTake(s_spi_dma_lock, portMAX_DELAY);
+		tx_buf = s_spi_dma_buf;
+		rx_buf = s_spi_dma_buf;
+	} else {
+		/* 大传输（极少）fallback 到动态分配 */
+		tx_buf = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_DMA);
+		rx_buf = (uint8_t *)heap_caps_malloc(total, MALLOC_CAP_DMA);
+		if ((tx_buf == NULL) || (rx_buf == NULL)) {
+			ESP_LOGE("W25Q64", "SPI DMA alloc %d failed", total);
+			free(tx_buf);
+			free(rx_buf);
+			return ESP_ERR_NO_MEM;
+		}
 	}
 
 	memcpy(tx_buf, tx, tx_len);
@@ -68,8 +90,12 @@ static esp_err_t w25q64_spi_txrx(w25q64_handle_t *handle,
 		memcpy(rx, rx_buf + tx_len, rx_len);
 	}
 
-	free(tx_buf);
-	free(rx_buf);
+	if (use_static) {
+		if (s_spi_dma_lock) xSemaphoreGive(s_spi_dma_lock);
+	} else {
+		free(tx_buf);
+		free(rx_buf);
+	}
 	return err;
 }
 
@@ -278,6 +304,15 @@ esp_err_t w25q64_init(w25q64_handle_t **out_handle,
 	/* Ensure device is not in power-down */
 	w25q64_release_power_down(handle);
 
+	/* 初始化全局静态 DMA 缓冲区互斥锁（只初始化一次） */
+	if (s_spi_dma_lock == NULL) {
+		s_spi_dma_lock = xSemaphoreCreateMutex();
+		if (s_spi_dma_lock == NULL) {
+			err = ESP_ERR_NO_MEM;
+			goto fail;
+		}
+	}
+
 	*out_handle = handle;
 	ESP_LOGI(W25Q64_TAG, "init ok — JEDEC ID EFh %04Xh, freq %lu Hz",
 		 dev, config->freq_hz);
@@ -468,8 +503,10 @@ esp_err_t w25q64_page_program(w25q64_handle_t *handle,
 	free(tx_buf);
 	if (err != ESP_OK) return err;
 
-	/* 3. Wait for completion */
-	return w25q64_wait_busy(handle, W25Q64_DEF_TIMEOUT_MS);
+	/* 3. Fixed delay — Micron flash doesn't respond to status reads
+	 * during program.  50 ms covers the typical 256 B page program. */
+	vTaskDelay(pdMS_TO_TICKS(50));
+	return ESP_OK;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -483,14 +520,23 @@ static esp_err_t w25q64_erase(w25q64_handle_t *handle,
 
 	/* 1. Write Enable */
 	err = w25q64_write_enable(handle);
-	if (err != ESP_OK) return err;
+	if (err != ESP_OK) {
+		ESP_LOGE(W25Q64_TAG, "erase: write_enable failed: %s", esp_err_to_name(err));
+		return err;
+	}
 
 	/* 2. Send erase command + address */
 	err = w25q64_cmd_addr(handle, cmd, addr);
-	if (err != ESP_OK) return err;
+	if (err != ESP_OK) {
+		ESP_LOGE(W25Q64_TAG, "erase: cmd_addr failed: %s", esp_err_to_name(err));
+		return err;
+	}
 
-	/* 3. Wait for completion */
-	return w25q64_wait_busy(handle, timeout_ms);
+	/* 3. Fixed delay — Micron flash doesn't respond to status reads
+	 * during erase, so we can't poll BUSY.  3 s is well above
+	 * the typical sector erase time of ~400 ms. */
+	vTaskDelay(pdMS_TO_TICKS(3000));
+	return ESP_OK;
 }
 
 esp_err_t w25q64_sector_erase(w25q64_handle_t *handle, uint32_t addr)

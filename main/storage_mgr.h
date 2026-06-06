@@ -205,6 +205,12 @@ uint32_t storage_sample_interval_s(void);
 esp_err_t img_cache_erase_all(void);
 
 /**
+ * @brief  Erase a single 4 KB sector in the image cache region.
+ * @param  offset  byte offset within IMG_CACHE region, must be 4 KB aligned.
+ */
+esp_err_t img_cache_erase_sector(uint32_t offset);
+
+/**
  * @brief  Write data to the image cache region.
  * @param  offset  byte offset within IMG_CACHE region (0 … IMG_CACHE_SIZE-1)
  * @param  data    source buffer

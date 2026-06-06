@@ -3,8 +3,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
-#include "esp_timer.h"  /* for esp_timer_get_time                           */
+#include "esp_timer.h"
 
 #include "config.h"
 
@@ -508,21 +511,33 @@ esp_err_t img_cache_erase_all(void)
 	return ESP_OK;
 }
 
+esp_err_t img_cache_erase_sector(uint32_t offset)
+{
+	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
+	if (offset >= IMG_CACHE_SIZE || (offset & (W25Q64_SECTOR_SIZE - 1)) != 0) {
+		return ESP_ERR_INVALID_ARG;
+	}
+	uint32_t flash_addr = IMG_CACHE_BASE_ADDR + offset;
+	return w25q64_sector_erase(g_flash, flash_addr);
+}
+
 esp_err_t img_cache_write(uint32_t offset, const uint8_t *data, size_t len)
 {
 	if (g_flash == NULL) return ESP_ERR_NOT_SUPPORTED;
 	if (offset + len > IMG_CACHE_SIZE) return ESP_ERR_INVALID_ARG;
 
 	uint32_t addr = IMG_CACHE_BASE_ADDR + offset;
-	/* Ensure we don't cross a 256-byte page boundary */
-	size_t max_write = W25Q64_PAGE_SIZE - (addr % W25Q64_PAGE_SIZE);
-	if (len > max_write) {
-		ESP_LOGW(STORAGE_TAG, "img_cache_write truncated to %u B",
-			 max_write);
-		len = max_write;
+	/* Loop across 256-byte page boundaries — never truncate */
+	while (len > 0) {
+		size_t max_write = W25Q64_PAGE_SIZE - (addr % W25Q64_PAGE_SIZE);
+		size_t chunk = (len < max_write) ? len : max_write;
+		esp_err_t err = w25q64_page_program(g_flash, addr, data, chunk);
+		if (err != ESP_OK) return err;
+		addr   += chunk;
+		data   += chunk;
+		len    -= chunk;
 	}
-
-	return w25q64_page_program(g_flash, addr, data, len);
+	return ESP_OK;
 }
 
 esp_err_t img_cache_read(uint32_t offset, uint8_t *data, size_t len)

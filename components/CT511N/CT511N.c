@@ -664,7 +664,7 @@ esp_err_t ct511n_tcp_single_connect(ct511n_handle_t *handle, const char *ip, con
 	
 	s_tcp_target_ip = ip;
 	s_tcp_target_port = port;
-	err = reset(ct511n_4g_tcp_on_retry, handle, "CIPOPEN ok", 10, CT511N_RETRY_DELAY_MID_MS);
+	err = reset(ct511n_4g_tcp_on_retry, handle, "CIPOPEN ok", 1, CT511N_RETRY_DELAY_MID_MS);
 	if (err != ESP_OK) {
 		s_tcp_target_ip = NULL;
 		s_tcp_target_port = NULL;
@@ -919,6 +919,52 @@ esp_err_t ct511n_gps_get(ct511n_handle_t *handle, char *gps_buf, size_t gps_buf_
 		gps_buf[len] = '\0';
 	}
 
+	return ESP_OK;
+}
+
+esp_err_t ct511n_gps_get_time(ct511n_handle_t *handle, char *time_buf, size_t time_buf_size)
+{
+	esp_err_t err;
+	char *gps_start, *gps_end;
+	char raw[128];
+
+	if (!handle || !time_buf || !time_buf_size) return ESP_ERR_INVALID_ARG;
+	time_buf[0] = '\0';
+
+	err = ct511n_send_at_command(handle, CT511N_AT_CMD_GPSST,
+				     handle->at_buf, sizeof(handle->at_buf),
+				     CT511N_RETRY_DELAY_MID_MS, NULL);
+	if (err != ESP_OK) return err;
+
+	gps_start = strstr(handle->at_buf, "+GPSST: ");
+	if (!gps_start) return ESP_FAIL;  /* no GPS fix, skip quietly */
+	gps_start += strlen("+GPSST: ");
+
+	gps_end = strchr(gps_start, ';');
+	if (!gps_end) return ESP_FAIL;
+
+	size_t len = (size_t)(gps_end - gps_start);
+	if (len >= sizeof(raw)) len = sizeof(raw) - 1;
+
+	for (size_t i = 0; i < len; i++) {
+		char ch = gps_start[i];
+		raw[i] = (ch == ',') ? ' ' : ch;
+	}
+	raw[len] = '\0';
+
+	/* GPSST fields: lat lon alt speed course date time ... */
+	int field = 0;
+	char *token = strtok(raw, " ");
+	char date_str[16] = {0}, time_str[16] = {0};
+	while (token) {
+		if (field == 5) strncpy(date_str, token, sizeof(date_str)-1);
+		if (field == 6) strncpy(time_str, token, sizeof(time_str)-1);
+		field++;
+		token = strtok(NULL, " ");
+	}
+	if (!date_str[0] || !time_str[0]) return ESP_FAIL;
+
+	snprintf(time_buf, time_buf_size, "%s %s", date_str, time_str);
 	return ESP_OK;
 }
 
